@@ -288,15 +288,23 @@ _PAGE = """<!doctype html>
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
+    def _send_body(self, status, body, content_type):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            print("[dashboard] Client disconnected before the response was sent.")
+        except OSError as exc:
+            print(f"[dashboard] Response write failed: {type(exc).__name__}: {exc}")
+
     def _json_response(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_body(status, body, "application/json; charset=utf-8")
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -310,16 +318,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             body = json.dumps(snapshot().get("settings", {}), ensure_ascii=False).encode("utf-8")
             content_type = "application/json; charset=utf-8"
         else:
-            self.send_error(404)
+            self._json_response(404, {"error": "Not found."})
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_body(200, body, content_type)
 
     def do_POST(self):
         try:
@@ -359,8 +361,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 _face_service.stop()
                 self._json_response(200, {"message": "Local face recognition stopped."})
             elif path == "/api/faces/delete" and _face_service:
-                _face_service.delete_profile(payload.get("profile_id", ""))
-                self._json_response(200, {"message": "Face profile removed from local storage."})
+                message = _face_service.delete_profile(payload.get("profile_id", ""))
+                self._json_response(200, {"message": message or "Face profile removed from local storage."})
             elif path == "/api/faces/permissions" and _face_service:
                 _face_service.set_profile_role(payload.get("profile_id", ""), payload.get("role", ""))
                 self._json_response(200, {"message": "Profile permissions updated."})
@@ -368,8 +370,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._json_response(404, {"error": "Control endpoint unavailable."})
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self._json_response(400, {"error": str(exc)})
-        except Exception as exc:
+        except RuntimeError as exc:
             self._json_response(409, {"error": str(exc)})
+        except OSError as exc:
+            print(f"[dashboard] Control operation failed: {type(exc).__name__}: {exc}")
+            self._json_response(500, {"error": "The requested change could not be saved or completed."})
+        except Exception as exc:
+            print(f"[dashboard] Control operation failed: {type(exc).__name__}: {exc}")
+            self._json_response(500, {"error": "The dashboard could not complete that request."})
 
     def log_message(self, fmt, *args):
         return
@@ -385,10 +393,18 @@ def start_dashboard(open_browser=True):
     global _server
     if _server is None:
         try:
-            _server = _DashboardServer((HOST, PORT), _DashboardHandler)
+            server = _DashboardServer((HOST, PORT), _DashboardHandler)
         except OSError as exc:
             raise RuntimeError(f"Could not start dashboard at {URL}: {exc}") from exc
-        threading.Thread(target=_server.serve_forever, name="jarvis-dashboard", daemon=True).start()
+        thread = threading.Thread(target=_serve_dashboard, args=(server,),
+                                  name="jarvis-dashboard", daemon=True)
+        _server = server
+        try:
+            thread.start()
+        except Exception as exc:
+            _server = None
+            server.server_close()
+            raise RuntimeError(f"Could not start dashboard server: {type(exc).__name__}: {exc}") from exc
     if open_browser:
         opened = False
         for name in ("firefox", "chromium", "chromium-browser", "google-chrome", "brave-browser"):
@@ -412,6 +428,21 @@ def start_dashboard(open_browser=True):
         if not opened:
             print(f"[dashboard] Open {URL} in a browser.")
     return URL
+
+
+def _serve_dashboard(server):
+    global _server
+    try:
+        server.serve_forever()
+    except Exception as exc:
+        print(f"[dashboard] Server stopped unexpectedly: {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            server.server_close()
+        except OSError as exc:
+            print(f"[dashboard] Server cleanup failed: {type(exc).__name__}: {exc}")
+        if _server is server:
+            _server = None
 
 
 def configure_controls(settings_handler=None, face_service=None):

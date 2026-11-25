@@ -5,6 +5,9 @@ JARVIS config directory and are never added to the repository.
 """
 import json
 import os
+import re
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -36,6 +39,7 @@ class FaceRecognitionService:
         self._present = {}
         self._candidate_id = None
         self._candidate_since = 0.0
+        self._profile_store_blocked = False
         self._profiles = self._load_profiles()
         self._state = {
             "status": "disabled", "identity": None, "profile_info": "",
@@ -49,9 +53,52 @@ class FaceRecognitionService:
         try:
             with open(self.profiles_path, encoding="utf-8") as f:
                 raw = json.load(f)
-            return raw if isinstance(raw, dict) else {}
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {}
+        except OSError as exc:
+            self._profile_store_blocked = True
+            print(f"[face] Could not load profiles.json: {type(exc).__name__}: {exc}")
+            return {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            self._preserve_invalid_profiles(f"invalid JSON ({type(exc).__name__})")
+            return {}
+        if not isinstance(raw, dict):
+            self._preserve_invalid_profiles("unexpected JSON structure")
+            print("[face] profiles.json must contain an object; ignoring invalid profile data")
+            return {}
+        profiles = {}
+        for profile_id, profile in raw.items():
+            valid_id = (isinstance(profile_id, str)
+                        and re.fullmatch(r"[0-9a-f]{32}", profile_id))
+            valid_profile = (
+                isinstance(profile, dict)
+                and isinstance(profile.get("name"), str) and bool(profile["name"].strip())
+                and isinstance(profile.get("info", ""), str)
+                and isinstance(profile.get("role", "user"), str)
+                and profile.get("role", "user") in {"guest", "user", "admin"}
+                and isinstance(profile.get("label"), int)
+                and not isinstance(profile.get("label"), bool)
+                and profile["label"] > 0
+            )
+            if valid_id and valid_profile:
+                profile.setdefault("role", "user")
+                profiles[profile_id] = profile
+            else:
+                print(f"[face] Ignoring malformed profile entry {profile_id!r}")
+        if len(profiles) != len(raw):
+            self._preserve_invalid_profiles("malformed profile entries")
+        return profiles
+
+    def _preserve_invalid_profiles(self, reason):
+        backup = f"{self.profiles_path}.corrupt-{uuid.uuid4().hex}"
+        try:
+            shutil.copy2(self.profiles_path, backup)
+        except OSError as exc:
+            self._profile_store_blocked = True
+            print(f"[face] Could not preserve profiles.json after {reason}: {exc}")
+        else:
+            self._profile_store_blocked = False
+            print(f"[face] Preserved invalid profile data at {backup} ({reason}).")
 
     def _profile_list(self):
         return [{"id": key, "name": item.get("name", ""), "info": item.get("info", ""),
@@ -68,13 +115,23 @@ class FaceRecognitionService:
             self._cascade = cv2.CascadeClassifier(cascade_path)
             if self._cascade.empty():
                 raise RuntimeError("OpenCV face detection data could not be loaded")
+            if self._profile_store_blocked:
+                raise RuntimeError("Profile data could not be read; fix profiles.json before enabling recognition.")
             if os.path.isfile(self.model_path):
                 self._recognizer = cv2.face.LBPHFaceRecognizer_create()
-                self._recognizer.read(self.model_path)
+                try:
+                    self._recognizer.read(self.model_path)
+                except Exception as exc:
+                    print(f"[face] Could not load recognizer model: {type(exc).__name__}: {exc}; rebuilding")
+                    self._recognizer = None
+                    self._train()
             elif self._profiles:
                 self._train()
             self._set_state(status="ready", message="Local face recognition is ready.")
         except Exception as exc:
+            self._cv2 = None
+            self._cascade = None
+            self._recognizer = None
             self._set_state(status="unavailable", message=str(exc))
 
     def _set_state(self, **changes):
@@ -82,9 +139,20 @@ class FaceRecognitionService:
             self._state.update(changes)
             self._state["profiles"] = self._profile_list()
             snapshot = json.loads(json.dumps(self._state))
-        self.on_state(snapshot)
-        for message in self._update_presence(snapshot):
-            self.on_presence(message)
+        try:
+            self.on_state(snapshot)
+        except Exception as exc:
+            print(f"[face] State callback failed: {type(exc).__name__}: {exc}")
+        try:
+            messages = self._update_presence(snapshot)
+        except Exception as exc:
+            print(f"[face] Presence tracking failed: {type(exc).__name__}: {exc}")
+            return
+        for message in messages:
+            try:
+                self.on_presence(message)
+            except Exception as exc:
+                print(f"[face] Presence callback failed: {type(exc).__name__}: {exc}")
 
     def set_departure_grace(self, seconds):
         with self._lock:
@@ -136,9 +204,14 @@ class FaceRecognitionService:
         if self._thread and self._thread.is_alive():
             return True
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="jarvis-face-recognition", daemon=True)
-        self._thread.start()
         self._set_state(status="connecting", message=f"Connecting to {self.stream_url}")
+        self._thread = threading.Thread(target=self._run, name="jarvis-face-recognition", daemon=True)
+        try:
+            self._thread.start()
+        except Exception as exc:
+            self._thread = None
+            self._set_state(status="error", message=f"Could not start recognition: {type(exc).__name__}: {exc}")
+            return False
         return True
 
     def stop(self):
@@ -158,7 +231,8 @@ class FaceRecognitionService:
             raise ValueError("Enter a name for this face profile.")
         if self._cv2 is None:
             raise RuntimeError("Face recognition is unavailable; install opencv-contrib-python-headless.")
-        self.start()
+        if not self.start():
+            raise RuntimeError("Face recognition could not start; check the dashboard status.")
         with self._lock:
             if self._pending:
                 raise RuntimeError("An enrollment is already in progress.")
@@ -176,17 +250,49 @@ class FaceRecognitionService:
         self._set_state(status="monitoring", enrollment_count=0, message="Enrollment cancelled.")
 
     def delete_profile(self, profile_id):
+        profile_id = str(profile_id)
+        profile_dir = os.path.join(self.data_dir, profile_id)
+        quarantine = None
         with self._lock:
-            profile = self._profiles.pop(str(profile_id), None)
+            profile = self._profiles.get(profile_id)
             if not profile:
                 raise ValueError("That face profile was not found.")
+            if os.path.lexists(profile_dir):
+                quarantine = os.path.join(self.data_dir,
+                                          f".{profile_id}.deleting-{uuid.uuid4().hex}")
+                os.replace(profile_dir, quarantine)
+            self._profiles.pop(profile_id)
+            try:
+                self._save_profiles()
+            except Exception:
+                self._profiles[profile_id] = profile
+                if quarantine:
+                    try:
+                        os.replace(quarantine, profile_dir)
+                    except OSError as restore_exc:
+                        print(f"[face] Could not restore profile samples after save failure: {restore_exc}")
+                raise
             if self._state.get("identity") == profile.get("name"):
                 self._state.update(identity=None, profile_info="")
-        import shutil
-        shutil.rmtree(os.path.join(self.data_dir, str(profile_id)), ignore_errors=True)
-        self._save_profiles()
-        self._train()
-        self._set_state(status="monitoring", message=f"Removed face profile for {profile.get('name')}.")
+        warning = ""
+        if quarantine:
+            try:
+                if os.path.islink(quarantine):
+                    os.unlink(quarantine)
+                else:
+                    shutil.rmtree(quarantine)
+            except OSError as exc:
+                warning = " Profile metadata was removed, but sample cleanup failed."
+                print(f"[face] Could not remove samples for {profile.get('name')}: {exc}")
+        try:
+            self._train()
+        except Exception as exc:
+            warning += " Recognition retraining failed; restart JARVIS to retry."
+            print(f"[face] Retraining after profile deletion failed: {type(exc).__name__}: {exc}")
+        status = "error" if warning else "monitoring"
+        message = f"Removed face profile for {profile.get('name')}.{warning}"
+        self._set_state(status=status, message=message)
+        return message
 
     def set_profile_role(self, profile_id, role):
         if role not in {"guest", "user", "admin"}:
@@ -195,8 +301,13 @@ class FaceRecognitionService:
             profile = self._profiles.get(str(profile_id))
             if not profile:
                 raise ValueError("That face profile was not found.")
+            previous_role = profile.get("role", "user")
             profile["role"] = role
-        self._save_profiles()
+            try:
+                self._save_profiles()
+            except Exception:
+                profile["role"] = previous_role
+                raise
         self._set_state(message=f"Updated {profile.get('name')} permissions to {role}.")
 
     def current_profile(self, max_age=3.0):
@@ -216,12 +327,36 @@ class FaceRecognitionService:
             return None
 
     def _save_profiles(self):
+        if self._profile_store_blocked:
+            raise RuntimeError("Profile data could not be read; fix profiles.json before changing profiles.")
         os.makedirs(self.data_dir, mode=0o700, exist_ok=True)
-        tmp = self.profiles_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._profiles, f, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.profiles_path)
+        fd = None
+        tmp = None
+        try:
+            with self._lock:
+                profiles = {profile_id: dict(profile)
+                            for profile_id, profile in self._profiles.items()}
+            fd, tmp = tempfile.mkstemp(prefix=".profiles.", suffix=".tmp", dir=self.data_dir)
+            os.fchmod(fd, 0o600)
+            output = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None
+            with output as f:
+                json.dump(profiles, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.profiles_path)
+            tmp = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError as exc:
+                    print(f"[face] Temporary profile file cleanup failed: {exc}")
 
     def _face_crop(self, frame):
         cv2 = self._cv2
@@ -238,22 +373,33 @@ class FaceRecognitionService:
     def _run(self):
         cv2 = self._cv2
         while not self._stop.is_set():
-            capture = cv2.VideoCapture(self.stream_url)
+            capture = None
             try:
+                capture = cv2.VideoCapture(self.stream_url)
+                if capture is None:
+                    raise RuntimeError("OpenCV could not create the video capture.")
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 if not capture.isOpened():
                     self._set_state(status="disconnected", message=f"Cannot open {self.stream_url}")
                     self._stop.wait(3)
                     continue
+                if self._profiles and self._recognizer is None:
+                    self._train()
                 self._set_state(status="monitoring", message="Watching the local Motion stream.")
                 last_result = 0.0
                 while not self._stop.is_set():
                     ok, frame = capture.read()
                     if not ok:
+                        self._recognition_time = 0.0
+                        self._set_state(status="disconnected", identity=None, profile_id=None,
+                                        profile_role=None, profile_info="",
+                                        message="Motion stream stopped; reconnecting.")
                         break
                     now = time.time()
                     with self._lock:
                         pending = self._pending
+                        recognizer = self._recognizer
+                        profiles = list(self._profiles.items())
                     if pending:
                         crop = self._face_crop(frame)
                         if crop is not None and now - pending["last_sample"] >= self.SAMPLE_INTERVAL:
@@ -269,18 +415,20 @@ class FaceRecognitionService:
                         continue
                     last_result = now
                     crop = self._face_crop(frame)
-                    if crop is None or self._recognizer is None:
+                    if crop is None or recognizer is None:
                         self._recognition_time = 0.0
                         self._set_state(status="monitoring", identity=None, profile_id=None,
                                         profile_role=None, profile_info="", last_seen=None,
-                                        message="No enrolled face detected." if crop is None else "No face profiles enrolled.")
+                                        message=("No enrolled face detected." if crop is None else
+                                                 "No face profiles enrolled." if not profiles else
+                                                 "Face profiles are loaded, but the recognizer is unavailable."))
                         continue
-                    label, distance = self._recognizer.predict(crop)
-                    profile = next((p for p in self._profiles.values()
+                    label, distance = recognizer.predict(crop)
+                    profile = next((p for _, p in profiles
                                     if int(p.get("label", -1)) == int(label)), None)
                     if profile and float(distance) <= self.MATCH_DISTANCE:
                         self._recognition_time = time.monotonic()
-                        profile_id = next((pid for pid, p in self._profiles.items() if p is profile), None)
+                        profile_id = next((pid for pid, p in profiles if p is profile), None)
                         self._set_state(status="recognized", identity=profile.get("name"),
                                         profile_id=profile_id, profile_role=profile.get("role", "user"),
                                         profile_info=profile.get("info", ""), last_seen=time.strftime("%H:%M:%S"),
@@ -293,30 +441,77 @@ class FaceRecognitionService:
             except Exception as exc:
                 self._set_state(status="error", message=f"Face recognition error: {type(exc).__name__}: {exc}")
             finally:
-                capture.release()
+                if capture is not None:
+                    try:
+                        capture.release()
+                    except Exception as exc:
+                        print(f"[face] Video capture cleanup failed: {type(exc).__name__}: {exc}")
             self._stop.wait(2)
+        self._set_state(status="stopped", identity=None, profile_id=None,
+                        profile_role=None, profile_info="", message="Recognition stopped.")
 
     def _finish_enrollment(self, pending):
         profile_dir = os.path.join(self.data_dir, pending["id"])
-        os.makedirs(profile_dir, mode=0o700, exist_ok=True)
-        for index, sample in enumerate(pending["samples"], start=1):
-            self._cv2.imwrite(os.path.join(profile_dir, f"{index:03d}.png"), sample)
+        try:
+            os.makedirs(profile_dir, mode=0o700, exist_ok=False)
+            for index, sample in enumerate(pending["samples"], start=1):
+                output = os.path.join(profile_dir, f"{index:03d}.png")
+                if not self._cv2.imwrite(output, sample):
+                    raise OSError(f"OpenCV could not write enrollment sample {index}.")
+        except Exception:
+            with self._lock:
+                if self._pending is pending:
+                    self._pending = None
+            try:
+                shutil.rmtree(profile_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                print(f"[face] Could not remove incomplete enrollment samples: {cleanup_exc}")
+            raise
+
         with self._lock:
+            if self._pending is not pending:
+                shutil.rmtree(profile_dir)
+                return
             self._profiles[pending["id"]] = {
                 "name": pending["name"], "info": pending["info"], "role": pending["role"],
                 "label": pending["label"],
             }
             self._pending = None
-        self._save_profiles()
-        self._train()
+            try:
+                self._save_profiles()
+            except Exception:
+                self._profiles.pop(pending["id"], None)
+                try:
+                    shutil.rmtree(profile_dir)
+                except OSError as cleanup_exc:
+                    print(f"[face] Could not remove unsaved enrollment samples: {cleanup_exc}")
+                raise
+        try:
+            self._train()
+        except Exception as exc:
+            message = (f"Enrollment saved for {pending['name']}, but recognition training failed: "
+                       f"{type(exc).__name__}: {exc}. Restart JARVIS to retry.")
+            print(f"[face] {message}")
+            self._set_state(status="error", enrollment_count=0, message=message)
+            return
         self._set_state(status="monitoring", enrollment_count=0,
                         message=f"Enrollment complete for {pending['name']}.")
 
     def _train(self):
         if self._cv2 is None:
             return
+        with self._lock:
+            profiles = {profile_id: dict(profile)
+                        for profile_id, profile in self._profiles.items()}
+            self._recognizer = None
+        try:
+            os.unlink(self.model_path)
+        except FileNotFoundError:
+            pass
         images, labels = [], []
-        for profile_id, profile in self._profiles.items():
+        for profile_id, profile in profiles.items():
             directory = os.path.join(self.data_dir, profile_id)
             if not os.path.isdir(directory):
                 continue
@@ -327,14 +522,32 @@ class FaceRecognitionService:
                     images.append(self._cv2.resize(image, (200, 200)))
                     labels.append(int(profile["label"]))
         if not images:
-            self._recognizer = None
-            if os.path.exists(self.model_path):
-                os.remove(self.model_path)
             return
         recognizer = self._cv2.face.LBPHFaceRecognizer_create()
         import numpy as np
         recognizer.train(images, np.asarray(labels, dtype=np.int32))
         os.makedirs(self.data_dir, mode=0o700, exist_ok=True)
-        recognizer.write(self.model_path)
-        os.chmod(self.model_path, 0o600)
-        self._recognizer = recognizer
+        fd = None
+        temporary_model = None
+        try:
+            fd, temporary_model = tempfile.mkstemp(prefix=".recognizer.", suffix=".yml",
+                                                   dir=self.data_dir)
+            os.close(fd)
+            fd = None
+            recognizer.write(temporary_model)
+            os.chmod(temporary_model, 0o600)
+            os.replace(temporary_model, self.model_path)
+            temporary_model = None
+            with self._lock:
+                self._recognizer = recognizer
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temporary_model:
+                try:
+                    os.unlink(temporary_model)
+                except OSError as exc:
+                    print(f"[face] Temporary recognizer cleanup failed: {exc}")
