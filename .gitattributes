@@ -1,0 +1,2 @@
+kokoro/*.onnx filter=lfs diff=lfs merge=lfs -text
+kokoro/*.bin filter=lfs diff=lfs merge=lfs -text
