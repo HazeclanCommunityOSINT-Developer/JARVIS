@@ -20,7 +20,7 @@ class TelegramBotDaemon:
         if not token or ":" not in token:
             raise ValueError("Telegram bot token is missing or malformed.")
         self._token = token
-        self._allowed_users = {int(user_id) for user_id in allowed_user_ids}
+        self._allowed_users = set(allowed_user_ids)
         self._on_message = on_message
         self._on_status = on_status or (lambda _status: None)
         self._on_event = on_event or (lambda _kind, _detail: None)
@@ -47,8 +47,21 @@ class TelegramBotDaemon:
         allowed_users = config.get("allowed_user_ids", [])
         if not isinstance(allowed_users, list):
             raise RuntimeError("allowed_user_ids must be a JSON array of numeric Telegram user IDs.")
+        parsed_users = []
+        for user_id in allowed_users:
+            if isinstance(user_id, bool) or not isinstance(user_id, (int, str)):
+                raise RuntimeError("allowed_user_ids must contain only positive numeric Telegram user IDs.")
+            if isinstance(user_id, str) and not user_id.isdecimal():
+                raise RuntimeError("allowed_user_ids must contain only positive numeric Telegram user IDs.")
+            try:
+                parsed_id = int(user_id)
+            except ValueError as exc:
+                raise RuntimeError("allowed_user_ids must contain only positive numeric Telegram user IDs.") from exc
+            if parsed_id <= 0:
+                raise RuntimeError("allowed_user_ids must contain only positive numeric Telegram user IDs.")
+            parsed_users.append(parsed_id)
         try:
-            return cls(config.get("bot_token"), allowed_users, on_message,
+            return cls(config.get("bot_token"), parsed_users, on_message,
                        on_status, on_event)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Invalid Telegram config: {exc}") from exc
@@ -59,10 +72,30 @@ class TelegramBotDaemon:
 
     def _set_status(self, value):
         self._status = value
-        self._on_status(value)
+        try:
+            self._on_status(value)
+        except Exception as exc:
+            print(f"[telegram] Status callback failed: {type(exc).__name__}")
 
     def _add_event(self, detail):
-        self._on_event("Telegram", detail)
+        try:
+            self._on_event("Telegram", detail)
+        except Exception as exc:
+            print(f"[telegram] Event callback failed: {type(exc).__name__}")
+
+    def _safe_error(self, exc):
+        try:
+            detail = str(exc)
+        except Exception:
+            detail = "unprintable error"
+        if self._token:
+            detail = detail.replace(self._token, "[redacted]")
+        return f"{type(exc).__name__}: {detail[:240]}"
+
+    def _report_error(self, stage, exc):
+        detail = f"{stage}: {self._safe_error(exc)}"
+        print(f"[telegram] {detail}")
+        self._add_event(detail)
 
     def _api(self, method, payload=None, timeout=35):
         url = f"https://api.telegram.org/bot{self._token}/{method}"
@@ -73,18 +106,26 @@ class TelegramBotDaemon:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 result = json.load(response)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            raise RuntimeError(f"Telegram {method} request failed: {exc}") from exc
-        if not result.get("ok"):
+            raise RuntimeError(f"Telegram {method} request failed: {self._safe_error(exc)}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Telegram {method} returned an invalid response.")
+        if result.get("ok") is not True:
             raise RuntimeError(f"Telegram {method} failed with error code {result.get('error_code')}.")
         return result.get("result")
 
     def start(self):
         if self._thread and self._thread.is_alive():
-            return
+            return True
         self._stop.clear()
         self._set_status("starting")
         self._thread = threading.Thread(target=self._poll, name="jarvis-telegram", daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception as exc:
+            self._set_status("connection-error")
+            self._report_error("Could not start polling thread", exc)
+            return False
+        return True
 
     def stop(self):
         self._stop.set()
@@ -94,6 +135,8 @@ class TelegramBotDaemon:
         backoff = 2
         try:
             webhook = self._api("getWebhookInfo", timeout=15) or {}
+            if not isinstance(webhook, dict):
+                raise RuntimeError("Telegram returned invalid webhook information.")
             if webhook.get("url"):
                 self._set_status("webhook-conflict")
                 self._add_event("A webhook is configured; long polling cannot receive messages.")
@@ -102,7 +145,7 @@ class TelegramBotDaemon:
             self._set_status("online")
         except Exception as exc:
             self._set_status("connection-error")
-            self._add_event(f"Telegram connection check failed: {type(exc).__name__}.")
+            self._report_error("Connection check failed", exc)
         while not self._stop.is_set():
             try:
                 updates = self._api("getUpdates", {
@@ -110,18 +153,29 @@ class TelegramBotDaemon:
                     "timeout": 25,
                     "allowed_updates": json.dumps(["message"]),
                 }) or []
+                if not isinstance(updates, list):
+                    raise RuntimeError("Telegram getUpdates returned an invalid update list.")
                 backoff = 2
                 self._set_status("online")
                 for update in updates:
-                    self._offset = int(update.get("update_id", 0)) + 1
-                    self._handle_update(update)
+                    if not isinstance(update, dict):
+                        self._report_error("Skipping malformed update", ValueError("Expected an object."))
+                        continue
+                    update_id = update.get("update_id")
+                    if isinstance(update_id, bool) or not isinstance(update_id, int):
+                        self._report_error("Skipping malformed update", ValueError("Invalid update ID."))
+                        continue
+                    self._offset = update_id + 1
+                    try:
+                        self._handle_update(update)
+                    except Exception as exc:
+                        # Isolate a failed reply so the rest of this poll batch can proceed.
+                        self._report_error("Update handling failed", exc)
                     if self._stop.is_set():
                         break
             except Exception as exc:
                 if not self._stop.is_set():
-                    # Avoid printing request URLs because they contain the bot token.
-                    print(f"[telegram] Poll failed: {type(exc).__name__}; retrying in {backoff}s")
-                    self._add_event(f"Telegram polling failed: {type(exc).__name__}; retrying.")
+                    self._report_error(f"Polling failed; retrying in {backoff}s", exc)
                     self._set_status("connection-error")
                     self._stop.wait(backoff)
                     backoff = min(backoff * 2, 60)
@@ -156,8 +210,7 @@ class TelegramBotDaemon:
         try:
             reply = self._on_message(user_id, normalized)
         except Exception as exc:
-            print(f"[telegram] Message handling failed: {type(exc).__name__}")
-            self._add_event(f"Message handling failed: {type(exc).__name__}.")
+            self._report_error("Message handling failed", exc)
             reply = "I couldn't process that just now."
         self._send_message(chat_id, reply or "I've got nothing.")
         self._add_event("Sent a reply.")
