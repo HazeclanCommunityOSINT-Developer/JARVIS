@@ -1347,7 +1347,7 @@ TELEGRAM_HISTORY_LOCK = threading.Lock()
 
 
 def handle_telegram_message(user_id, text):
-    """Answer an allowlisted Telegram user without personal memory or local controls."""
+    """Answer a Telegram user without personal memory or local controls."""
     with TELEGRAM_HISTORY_LOCK:
         history = TELEGRAM_HISTORIES.setdefault(user_id, [])
         reply = think(
@@ -1388,6 +1388,7 @@ def main():
         telegram_bot = TelegramBotDaemon.from_config(
             TELEGRAM_CONFIG_FILE, handle_telegram_message,
             on_status=lambda status: dashboard.set_state(telegram=status),
+            on_event=dashboard.add_event,
         )
     except RuntimeError as exc:
         telegram_bot = None

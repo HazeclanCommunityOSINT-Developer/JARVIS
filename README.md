@@ -67,16 +67,17 @@ The optional Telegram bot daemon is implemented in `jarvis_telegram.py` and
 starts with `jarvis.py` when `~/.config/jarvis/telegram.json` exists. It uses
 Telegram long polling through the Bot API and standard-library HTTP; it needs
 outbound network access. Create a bot with BotFather, then write this local
-config (replace the token; keep the user list empty for initial ID discovery):
+config (replace the token):
 
 ```json
 {"bot_token":"YOUR_BOT_TOKEN","allowed_user_ids":[]}
 ```
 
 Save it at `~/.config/jarvis/telegram.json` with owner-only permissions (`chmod
-600`). Start JARVIS, open a private chat with your bot, and send `/id`. Add the
-returned numeric Telegram user ID to `allowed_user_ids`, then restart JARVIS.
-Only allowlisted private users can chat; Telegram access is limited to normal
+600`), then start JARVIS and message your bot in a private chat. An empty
+`allowed_user_ids` list (or an omitted list) allows any private Telegram user
+to chat. To restrict access, add numeric Telegram user IDs to the list; send
+`/id` to the bot to see your ID. Telegram access is limited to normal
 conversation, time, weather, and web search. Shell, desktop controls, saved
 personal memory, and Admin commands are not exposed over Telegram. Keep the bot
 token out of this repository.
