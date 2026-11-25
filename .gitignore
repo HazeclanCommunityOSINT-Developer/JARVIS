@@ -2,10 +2,6 @@
 /.venv/
 /venv/
 /env/
-/bin/
-/lib/
-/lib64
-/pyvenv.cfg
 __pycache__/
 *.py[cod]
 
@@ -14,7 +10,5 @@ __pycache__/
 *.backup
 *.bak*
 
-# Local speech model assets and generated audio
-/kokoro/*.onnx
-/kokoro/*.bin
+# Generated audio
 /kokoro_test.wav
