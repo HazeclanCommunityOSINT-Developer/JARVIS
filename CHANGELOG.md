@@ -18,8 +18,8 @@
 
 - An empty Telegram `allowed_user_ids` list now allows private users to chat;
   a populated list restricts access to those IDs.
-- Telegram configuration is loaded from `~/.config/jarvis/telegram.json`, with
-  a project-local `.config/jarvis/telegram.json` fallback.
+- Telegram configuration is read from `~/.config/jarvis/telegram.json` and
+  kept outside the project repository.
 - Added Telegram connection status, received-message activity, and webhook
   conflict diagnostics to the dashboard and terminal.
 - Bundled the Python runtime dependencies for the supported Linux/Python 3.13

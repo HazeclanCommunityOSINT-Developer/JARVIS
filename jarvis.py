@@ -66,11 +66,6 @@ DEFAULT_LOCATION = "Rutland, Vermont"  # used when you say "weather" with no pla
 DATA_DIR = os.path.expanduser("~/.config/jarvis")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, "telegram.json")
-PROJECT_TELEGRAM_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".config", "jarvis", "telegram.json"
-)
-if not os.path.isfile(TELEGRAM_CONFIG_FILE):
-    TELEGRAM_CONFIG_FILE = PROJECT_TELEGRAM_CONFIG_FILE
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")    # facts you tell it
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")  # recent chat, survives restarts
 

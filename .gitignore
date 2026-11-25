@@ -14,6 +14,7 @@ __pycache__/
 !/.config/
 !/.config/jarvis/
 !/.config/jarvis/**
+/.config/jarvis/telegram.json
 
 # Generated audio
 /kokoro_test.wav
