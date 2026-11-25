@@ -25,14 +25,13 @@ import urllib.request
 
 import numpy as np
 import ollama
-import sounddevice as sd
 from faster_whisper import WhisperModel
 
 # ---------- CONFIG ----------
 # Effort modes (say "fast mode", "normal mode", "deep mode"). If a model won't fit in RAM,
 # JARVIS steps down one level automatically. Deep needs ~9 GB free: close heavy apps.
 MODES = {"fast": "qwen3.5:4b", "normal": "qwen3.5:9b", "deep": "qwen3:14b"}
-MODE = "normal"
+MODE = "deep"
 LLM = MODES[MODE]
 MOTION_EVENTS = "/var/lib/motion/jarvis-events.jsonl"  # written by jarvis-motion-event.sh
 MOTION_ANNOUNCE = True    # speak when motion starts (rate-limited per camera)
@@ -43,7 +42,7 @@ KEEP_ALIVE = "5m"         # how long the model stays in RAM after the last use
 WHISPER = "base.en"       # "tiny.en" = faster, "small.en" = more accurate
 TTS_VOICE = "bm_george"   # British male (Kokoro). Also try: bm_fable, bm_lewis, bm_daniel
 TTS_SPEED = 0.95          # a touch slower sounds more composed
-KOKORO_DIR = os.path.expanduser("~/jarvis/kokoro/")
+KOKORO_DIR = os.path.expanduser("~/jarvis/kokoro")
 KOKORO_MODEL = "kokoro-v1.0.onnx"  # or "kokoro-v1.0.int8.onnx": smaller, a bit faster
 PIPER_VOICE = os.path.expanduser("~/.local/share/piper/en_US-lessac-medium.onnx")  # fallback
 SAMPLE_RATE = 16000
@@ -308,6 +307,7 @@ def llm_chat(**kw):
 def set_mode(name):
     global MODE, LLM
     MODE, LLM = name, MODES[name]
+    print(f"[model] Switched to {MODE.upper()}: {LLM}")
     return {"fast": "Fast mode.", "normal": "Normal mode.",
             "deep": "Deep mode. Close heavy apps if it struggles."}[name]
 
@@ -587,6 +587,8 @@ def fast_tools(text):
     if m:
         return set_mode({"fast": "fast", "quick": "fast", "normal": "normal",
                          "regular": "normal", "deep": "deep", "thinking": "deep"}[m.group(1)])
+    if re.search(r"\b(model|mode)\b", low) and re.search(r"\b(what|which|current|active|running|using)\b", low):
+        return f"We are in {MODE.upper()} mode, running {LLM} through Ollama."
     if re.search(r"\b(weather|forecast|temperature outside|will it (rain|snow))\b", low):
         m = re.search(r"\b(?:in|for|at)\s+(.+?)[\s.!?]*$", t, re.I)
         place = m.group(1) if m else ""
@@ -654,24 +656,47 @@ SPEAK_LOCK = threading.RLock()
 
 
 def listen():
+    import os
+    import signal
+    import subprocess
+    import tempfile
+    import time
+    import wave
     input("\n[Enter] to start talking...")
-    frames = []
-
-    def callback(indata, n, t, status):
-        frames.append(indata.copy())
-
-    LISTENING.set()
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    process = None
     try:
-        with sd.InputStream(device=5, samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=callback):
+        LISTENING.set()
+        try:
+            command = ["parecord", "--record", f"--rate={SAMPLE_RATE}", "--format=s16le", "--channels=1", "--file-format=wav", wav_path]
+            process = subprocess.Popen(command)
+            time.sleep(0.4)
+            if process.poll() is not None:
+                raise RuntimeError("parecord stopped before recording began")
             input("Listening... [Enter] to stop.")
+        finally:
+            if process is not None and process.poll() is None:
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    process.wait()
+            LISTENING.clear()
+        with wave.open(wav_path, "rb") as wav:
+            if wav.getnframes() == 0:
+                return ""
+            if wav.getframerate() != SAMPLE_RATE:
+                raise RuntimeError(f"Unexpected microphone rate: {wav.getframerate()}")
+            audio = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+        if audio.size == 0:
+            return ""
+        segments, _ = stt.transcribe(audio, language="en", vad_filter=True)
+        return " ".join(s.text for s in segments).strip()
     finally:
-        LISTENING.clear()
-    if not frames:
-        return ""
-    audio = np.concatenate(frames).flatten()
-    segments, _ = stt.transcribe(audio, language="en", vad_filter=True)
-    return " ".join(s.text for s in segments).strip()
-
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 _kokoro = None
 
@@ -843,6 +868,7 @@ def think(history, user_text):
 
 def main():
     history = clean_history(load_json(HISTORY_FILE, []))
+    print(f"[model] Starting in {MODE.upper()} mode: {LLM}")
     speak("Online.")
     if MOTION_ANNOUNCE:
         threading.Thread(target=motion_watcher, daemon=True).start()
