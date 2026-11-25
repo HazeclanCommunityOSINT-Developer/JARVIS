@@ -64,7 +64,9 @@ permissions. Without the optional OpenCV package, normal User behavior remains
 available but Admin commands stay unavailable.
 
 The optional Telegram bot daemon is implemented in `jarvis_telegram.py` and
-starts with `jarvis.py` when `~/.config/jarvis/telegram.json` exists. It uses
+starts with `jarvis.py` when its Telegram config exists. JARVIS checks
+`~/.config/jarvis/telegram.json` first, then `.config/jarvis/telegram.json`
+inside the project. It uses
 Telegram long polling through the Bot API and standard-library HTTP; it needs
 outbound network access. Create a bot with BotFather, then write this local
 config (replace the token):

@@ -1,7 +1,8 @@
 """Long-polling Telegram bot daemon for JARVIS.
 
-Reads credentials from ~/.config/jarvis/telegram.json. This module uses only
-the Python standard library and never exposes shell/admin tools to Telegram.
+Reads credentials from ~/.config/jarvis/telegram.json or the project-local
+.config/jarvis/telegram.json fallback. This module uses only the Python
+standard library and never exposes shell/admin tools to Telegram.
 """
 import json
 import os
