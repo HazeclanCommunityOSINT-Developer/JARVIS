@@ -63,6 +63,7 @@ class TwilioBridge:
         return {
             "enabled": False, "account_sid": "", "auth_token": "",
             "phone_number": "", "webhook_url": "", "allowed_numbers": [],
+            "connection_alert_number": "",
             "inbound_sms": False, "inbound_voice": False,
             "outbound_sms": False, "outbound_voice": False,
         }
@@ -76,7 +77,8 @@ class TwilioBridge:
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be true or false.")
             validated[key] = value
-        for key in ("account_sid", "auth_token", "phone_number", "webhook_url"):
+        for key in ("account_sid", "auth_token", "phone_number", "webhook_url",
+                    "connection_alert_number"):
             value = config.get(key, "")
             if not isinstance(value, str):
                 raise ValueError(f"{key} must be text.")
@@ -100,6 +102,10 @@ class TwilioBridge:
         if not isinstance(numbers, list) or any(not _phone(number) for number in numbers):
             raise ValueError("Allowed numbers must be a list of E.164 phone numbers.")
         validated["allowed_numbers"] = sorted(set(numbers))
+        if (validated["connection_alert_number"]
+                and (not _phone(validated["connection_alert_number"])
+                     or validated["connection_alert_number"] not in validated["allowed_numbers"])):
+            raise ValueError("Connection alert number must be an allowlisted E.164 phone number.")
         if validated["enabled"]:
             if not validated["account_sid"] or not validated["auth_token"]:
                 raise ValueError("Enter both a Twilio Account SID and Auth Token to enable Twilio.")
@@ -124,7 +130,8 @@ class TwilioBridge:
             raise ValueError("Twilio settings must be an object.")
         allowed = {"enabled", "account_sid", "auth_token", "phone_number",
                    "webhook_url", "allowed_numbers", "inbound_sms",
-                   "inbound_voice", "outbound_sms", "outbound_voice"}
+                   "inbound_voice", "outbound_sms", "outbound_voice",
+                   "connection_alert_number"}
         if set(values) != allowed:
             raise ValueError("Twilio settings request must include every supported setting.")
         candidate = dict(values)
@@ -347,7 +354,7 @@ class TwilioBridge:
             "".join(material).encode("utf-8"), hashlib.sha1).digest()).decode("ascii")
         return hmac.compare_digest(expected, signature)
 
-    def _api(self, endpoint, fields):
+    def _api(self, endpoint, fields, notify_errors=True):
         with self._lock:
             config = dict(self._config)
         if not config["enabled"] or not config["account_sid"] or not config["auth_token"]:
@@ -364,9 +371,30 @@ class TwilioBridge:
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 result = json.load(response)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except urllib.error.HTTPError as exc:
+            if notify_errors and exc.code >= 500:
+                self._event(f"Twilio API connection failed: HTTP {exc.code}.")
+            raise RuntimeError(f"Twilio request failed: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if notify_errors:
+                self._event(f"Twilio API connection failed: {type(exc).__name__}.")
             raise RuntimeError(f"Twilio request failed: {type(exc).__name__}") from exc
+        except ValueError as exc:
+            raise RuntimeError("Twilio returned an invalid response.") from exc
         return result
+
+    def send_connection_alert(self, message):
+        with self._lock:
+            config = dict(self._config)
+        recipient = config["connection_alert_number"]
+        if not config["enabled"] or not recipient:
+            raise RuntimeError("Twilio connection alerts are not configured.")
+        message = str(message or "").strip()
+        if not message or len(message) > 1500:
+            raise ValueError("Connection alert text must contain 1 to 1500 characters.")
+        self._api("Messages.json", {
+            "From": config["phone_number"], "To": recipient, "Body": message,
+        }, notify_errors=False)
 
     def send_sms(self, recipient, message):
         with self._lock:

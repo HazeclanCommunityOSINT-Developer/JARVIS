@@ -1877,7 +1877,7 @@ def main():
     FACE_SERVICE = face_service
     try:
         TWILIO_BRIDGE = TwilioBridge(
-            TWILIO_CONFIG_FILE, handle_twilio_message, on_event=dashboard.add_event)
+            TWILIO_CONFIG_FILE, handle_twilio_message, on_event=dashboard.twilio_event)
     except RuntimeError as exc:
         TWILIO_BRIDGE = None
         print(f"[twilio] {exc}")

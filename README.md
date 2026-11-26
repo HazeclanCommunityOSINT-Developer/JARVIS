@@ -117,6 +117,10 @@ Console, configure the phone number's incoming SMS URL as
 HTTPS origin in the dashboard. The voice endpoint uses Twilio speech
 recognition and returns spoken JARVIS replies; the application's webhook
 listener itself binds only to localhost.
+Optionally set a connection-error alert number in the dashboard. It must also
+be on the allowlist. JARVIS sends a rate-limited SMS when its own requests to
+Twilio fail to connect; this cannot detect Twilio webhook failures that never
+reach the local application.
 
 ## Privacy policy
 

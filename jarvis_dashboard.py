@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import webbrowser
 
 
@@ -18,6 +19,9 @@ _server = None
 _settings_handler = None
 _face_service = None
 _twilio_service = None
+_connection_alert_lock = threading.Lock()
+_last_connection_alert = None
+_CONNECTION_ALERT_COOLDOWN = 600
 _performance_lock = threading.Lock()
 _previous_cpu_times = None
 _state = {
@@ -61,6 +65,41 @@ def add_event(kind, detail):
     with _lock:
         _state["events"].append(item)
         del _state["events"][:-30]
+
+
+def alert_connection_error(detail):
+    """Text a rate-limited Twilio connection alert to the configured recipient."""
+    global _last_connection_alert
+    with _connection_alert_lock:
+        service = _twilio_service
+        if not service:
+            return
+        settings = service.settings()
+        recipient = settings.get("connection_alert_number")
+        if not settings.get("enabled") or not recipient:
+            return
+        now = time.monotonic()
+        if (_last_connection_alert is not None
+                and now - _last_connection_alert < _CONNECTION_ALERT_COOLDOWN):
+            return
+        _last_connection_alert = now
+
+    message = f"JARVIS Twilio connection error: {str(detail)[:220]}"
+
+    def send():
+        try:
+            service.send_connection_alert(message)
+            add_event("Twilio alert", "Sent a connection-error SMS alert.")
+        except (RuntimeError, ValueError, OSError) as exc:
+            add_event("Twilio alert error", f"Could not send connection alert: {type(exc).__name__}.")
+
+    threading.Thread(target=send, name="jarvis-twilio-alert", daemon=True).start()
+
+
+def twilio_event(kind, detail):
+    add_event(kind, detail)
+    if "connection failed" in str(detail).casefold():
+        alert_connection_error(detail)
 
 
 def snapshot():
@@ -343,6 +382,7 @@ _PAGE = """<!doctype html>
               <label class="setting">Twilio phone number<input name="phone_number" placeholder="+15551234567"></label>
               <label class="setting">Public HTTPS webhook origin<input name="webhook_url" placeholder="https://your-public-host.example"></label>
               <label class="setting">Allowed phone numbers · E.164<textarea name="allowed_numbers" rows="3" placeholder="+15551234567, one number per line"></textarea></label>
+              <label class="setting">Connection-error alert number · must be allowlisted<input name="connection_alert_number" placeholder="+15551234567"></label>
               <label class="setting check"><input name="enabled" type="checkbox"> Enable Twilio</label>
               <label class="setting check"><input name="inbound_sms" type="checkbox"> Allow inbound SMS</label>
               <label class="setting check"><input name="inbound_voice" type="checkbox"> Allow inbound voice</label>
@@ -427,6 +467,7 @@ _PAGE = """<!doctype html>
       form.elements.auth_token.value="";
       form.elements.auth_token.placeholder=t.auth_token_configured?"Saved · leave blank to keep":"Enter Twilio Auth Token";
       form.elements.allowed_numbers.value=(t.allowed_numbers||[]).join("\\n");
+      form.elements.connection_alert_number.value=t.connection_alert_number||"";
       for(const key of ["enabled","inbound_sms","inbound_voice","outbound_sms","outbound_voice"]){form.elements[key].checked=!!t[key];}
       put("twilio-webhook-paths",`Webhook endpoints: ${t.webhook_url||"set a public HTTPS origin"}/twilio/sms · /twilio/voice · /twilio/voice/response (local listener port ${t.webhook_port||8767})`);
     }
@@ -490,6 +531,7 @@ _PAGE = """<!doctype html>
         auth_token:f.elements.auth_token.value,phone_number:f.elements.phone_number.value,
         webhook_url:f.elements.webhook_url.value,
         allowed_numbers:f.elements.allowed_numbers.value.split(/[ ,\\t\\r\\n]+/).filter(Boolean),
+        connection_alert_number:f.elements.connection_alert_number.value,
         inbound_sms:f.elements.inbound_sms.checked,inbound_voice:f.elements.inbound_voice.checked,
         outbound_sms:f.elements.outbound_sms.checked,outbound_voice:f.elements.outbound_voice.checked
       },"twilio-message");
