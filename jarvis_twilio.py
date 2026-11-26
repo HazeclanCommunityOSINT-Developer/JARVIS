@@ -18,8 +18,8 @@ from xml.sax.saxutils import escape
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 MAX_BODY_BYTES = 16 * 1024
 WEBHOOK_BIND_HOSTS = {
-    "loopback": "127.0.0.1",
-    "all_interfaces": "0.0.0.0",
+    "loopback": "71.232.156.65",
+    "all_interfaces": "71.232.156.65",
 }
 WEBHOOK_PORT = 8767
 
@@ -64,12 +64,12 @@ class TwilioBridge:
     @staticmethod
     def _defaults():
         return {
-            "enabled": False, "account_sid": "", "auth_token": "",
+            "enabled": True, "account_sid": "", "auth_token": "",
             "phone_number": "", "webhook_url": "", "allowed_numbers": [],
             "webhook_bind": "loopback",
             "connection_alert_number": "",
-            "inbound_sms": False, "inbound_voice": False,
-            "outbound_sms": False, "outbound_voice": False,
+            "inbound_sms": False, "inbound_voice": True,
+            "outbound_sms": False, "outbound_voice": True,
         }
 
     @staticmethod
