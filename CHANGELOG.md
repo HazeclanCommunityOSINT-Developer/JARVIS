@@ -9,6 +9,14 @@
   fragment and adapts to narrow screens.
 - Telegram private chats can now use voice notes as spoken requests. JARVIS
   transcribes notes up to 2 minutes and 20 MB locally, then replies with text.
+- Voice requests display a `[thinking...]` status in the console and dashboard
+  while JARVIS routes or generates a response.
+- After a spoken reply, JARVIS listens for a follow-up for 10 seconds, so you can
+  continue the conversation without repeating the wake phrase.
+- Presence greetings include the active model, speech model, wake settings, VLC
+  availability, and downloaded-audio index count, delivered as a dry systems report.
+- JARVIS indexes supported audio files under the system Downloads folder and can
+  search for and play matching tracks with VLC.
 
 ### Fixed
 
@@ -17,6 +25,8 @@
   surface as errors instead of blocking the voice loop indefinitely.
 - Stop face-recognition and motion-watcher threads before JARVIS exits, avoiding
   abrupt interpreter shutdown while native camera code is running.
+- Defer the first Ctrl+C during native speech transcription for a clean shutdown;
+  a second Ctrl+C forces exit if the native call does not return.
 - Hardened settings, memory, and conversation-history loading against malformed
   or inaccessible files, and made JSON writes safer and atomic.
 - Improved Ollama fallback and failure reporting for weather, web search, system

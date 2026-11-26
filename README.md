@@ -22,8 +22,14 @@ Voice activation is enabled by default with the literal wake phrase `hey jarvis`
 word sequence, without command grammar or intent parsing. You can say the
 request immediately after the wake phrase, or wait for JARVIS to say “Yes?”
 before speaking. It confirms the phrase in two overlapping audio windows to
-reduce accidental activations. Set `WAKE_WORD_ENABLED = False` to use
-push-to-talk instead.
+reduce accidental activations. After each spoken answer, JARVIS listens for a
+follow-up for 10 seconds, so you can continue without repeating the wake phrase.
+Set `WAKE_WORD_ENABLED = False` to use push-to-talk instead.
+
+JARVIS indexes supported audio filenames under the system Downloads folder
+(from `xdg-user-dir DOWNLOAD`, falling back to `~/Downloads`). Ask it to play a
+track by title or ask what audio is available; VLC is used for playback. The
+index stores paths and filenames, not audio contents.
 
 In social conversation, JARVIS uses relevant facts and preferences saved through
 its memory feature to personalize replies. It is instructed not to force personal
@@ -40,9 +46,10 @@ The dashboard Settings panel controls the active effort mode, wake phrase,
 voice activation, motion announcements, TTS voice and speed, default location,
 speech-recognition model, model keep-alive, tool-round limit, memory/history
 limits, voice/motion timing, and arrival/departure announcements. JARVIS greets
-an enrolled profile once after a stable face match and says goodbye only after
-the configured away delay (90 seconds by default). Camera outages and stopped
-recognition pause the away timer. Settings are stored in
+an enrolled profile once after a stable face match with a concise report of the
+active model, speech configuration, wake mode, and audio/VLC status. It says
+goodbye only after the configured away delay (90 seconds by default). Camera
+outages and stopped recognition pause the away timer. Settings are stored in
 `~/.config/jarvis/settings.json`; JARVIS still starts in Fast (4B) mode, and a
 speech-recognition model change takes effect after restart.
 
