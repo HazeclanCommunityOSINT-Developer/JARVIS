@@ -374,13 +374,14 @@ _PAGE = """<!doctype html>
         </article>
         <article class="panel" style="margin-top:14px">
           <h2>Twilio SMS and VoIP voice</h2>
-          <p class="stream-note">Credentials stay in ~/.config/jarvis/twilio.json. Inbound webhooks require a public HTTPS tunnel to localhost:8767.</p>
+          <p class="stream-note">Credentials stay in ~/.config/jarvis/twilio.json. The listener speaks HTTP; use a TLS-terminating HTTPS proxy/tunnel. Keep Loopback for a proxy on this computer; select All interfaces when another device/router forwards HTTP to this computer.</p>
           <form id="twilio-form">
             <div class="settings-grid">
               <label class="setting">Account SID<input name="account_sid" autocomplete="off" placeholder="AC…"></label>
               <label class="setting">Auth Token<input name="auth_token" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved token"></label>
               <label class="setting">Twilio phone number<input name="phone_number" placeholder="+15551234567"></label>
               <label class="setting">Public HTTPS webhook origin<input name="webhook_url" placeholder="https://your-public-host.example"></label>
+              <label class="setting">Webhook network binding<select name="webhook_bind"><option value="loopback">Loopback only · local reverse proxy</option><option value="all_interfaces">All interfaces · router forwarding</option></select></label>
               <label class="setting">Allowed phone numbers · E.164<textarea name="allowed_numbers" rows="3" placeholder="+15551234567, one number per line"></textarea></label>
               <label class="setting">Connection-error alert number · must be allowlisted<input name="connection_alert_number" placeholder="+15551234567"></label>
               <label class="setting check"><input name="enabled" type="checkbox"> Enable Twilio</label>
@@ -464,6 +465,7 @@ _PAGE = """<!doctype html>
       if(!t||twilioDirty)return;
       const form=document.getElementById("twilio-form");
       for(const key of ["account_sid","phone_number","webhook_url"]){form.elements[key].value=t[key]||"";}
+      form.elements.webhook_bind.value=t.webhook_bind||"loopback";
       form.elements.auth_token.value="";
       form.elements.auth_token.placeholder=t.auth_token_configured?"Saved · leave blank to keep":"Enter Twilio Auth Token";
       form.elements.allowed_numbers.value=(t.allowed_numbers||[]).join("\\n");
@@ -529,7 +531,7 @@ _PAGE = """<!doctype html>
       const saved=await postControl("/api/twilio/settings",{
         enabled:f.elements.enabled.checked,account_sid:f.elements.account_sid.value,
         auth_token:f.elements.auth_token.value,phone_number:f.elements.phone_number.value,
-        webhook_url:f.elements.webhook_url.value,
+        webhook_url:f.elements.webhook_url.value,webhook_bind:f.elements.webhook_bind.value,
         allowed_numbers:f.elements.allowed_numbers.value.split(/[ ,\\t\\r\\n]+/).filter(Boolean),
         connection_alert_number:f.elements.connection_alert_number.value,
         inbound_sms:f.elements.inbound_sms.checked,inbound_voice:f.elements.inbound_voice.checked,

@@ -17,7 +17,10 @@ from xml.sax.saxutils import escape
 
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 MAX_BODY_BYTES = 16 * 1024
-WEBHOOK_HOST = "127.0.0.1"
+WEBHOOK_BIND_HOSTS = {
+    "loopback": "127.0.0.1",
+    "all_interfaces": "0.0.0.0",
+}
 WEBHOOK_PORT = 8767
 
 
@@ -63,6 +66,7 @@ class TwilioBridge:
         return {
             "enabled": False, "account_sid": "", "auth_token": "",
             "phone_number": "", "webhook_url": "", "allowed_numbers": [],
+            "webhook_bind": "loopback",
             "connection_alert_number": "",
             "inbound_sms": False, "inbound_voice": False,
             "outbound_sms": False, "outbound_voice": False,
@@ -83,6 +87,10 @@ class TwilioBridge:
             if not isinstance(value, str):
                 raise ValueError(f"{key} must be text.")
             validated[key] = value.strip()
+        webhook_bind = config.get("webhook_bind", "loopback")
+        if webhook_bind not in WEBHOOK_BIND_HOSTS:
+            raise ValueError("Webhook bind must be loopback or all_interfaces.")
+        validated["webhook_bind"] = webhook_bind
         if validated["account_sid"] and not re.fullmatch(r"AC[0-9a-fA-F]{32}", validated["account_sid"]):
             raise ValueError("Twilio Account SID must start with AC and contain 32 hexadecimal characters.")
         if validated["phone_number"] and not _phone(validated["phone_number"]):
@@ -131,7 +139,7 @@ class TwilioBridge:
         allowed = {"enabled", "account_sid", "auth_token", "phone_number",
                    "webhook_url", "allowed_numbers", "inbound_sms",
                    "inbound_voice", "outbound_sms", "outbound_voice",
-                   "connection_alert_number"}
+                   "connection_alert_number", "webhook_bind"}
         if set(values) != allowed:
             raise ValueError("Twilio settings request must include every supported setting.")
         candidate = dict(values)
@@ -154,15 +162,17 @@ class TwilioBridge:
                 os.unlink(temporary)
         with self._lock:
             self._config = candidate
-        self._set_webhook_running(candidate["enabled"]
-                                  and (candidate["inbound_sms"] or candidate["inbound_voice"]))
+        self._set_webhook_running(
+            candidate["enabled"] and (candidate["inbound_sms"] or candidate["inbound_voice"]),
+            candidate["webhook_bind"])
         return self.settings()
 
     def start(self):
         with self._lock:
             should_listen = (self._config["enabled"]
                              and (self._config["inbound_sms"] or self._config["inbound_voice"]))
-        self._set_webhook_running(should_listen)
+            bind_host = self._config["webhook_bind"]
+        self._set_webhook_running(should_listen, bind_host)
 
     def stop(self):
         with self._lock:
@@ -173,18 +183,18 @@ class TwilioBridge:
             server.shutdown()
             server.server_close()
 
-    def _set_webhook_running(self, enabled):
+    def _set_webhook_running(self, enabled, bind_host="loopback"):
+        address = WEBHOOK_BIND_HOSTS[bind_host]
         with self._lock:
             current = self._server
-        if enabled and current:
+        if enabled and current and current.server_address[0] == address:
             return
-        if not enabled and current:
+        if current:
             with self._lock:
                 self._server = None
                 self._thread = None
             current.shutdown()
             current.server_close()
-            return
         if not enabled:
             return
         bridge = self
@@ -197,9 +207,10 @@ class TwilioBridge:
                 return
 
         try:
-            server = ThreadingHTTPServer((WEBHOOK_HOST, WEBHOOK_PORT), Handler)
+            server = ThreadingHTTPServer((address, WEBHOOK_PORT), Handler)
         except OSError as exc:
-            raise RuntimeError(f"Could not start Twilio webhook listener on port {WEBHOOK_PORT}: {exc}") from exc
+            raise RuntimeError(
+                f"Could not start Twilio webhook listener on {address}:{WEBHOOK_PORT}: {exc}") from exc
         server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever,
                                   name="jarvis-twilio-webhook", daemon=True)

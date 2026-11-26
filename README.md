@@ -109,14 +109,20 @@ numbers with a valid Twilio request signature. Telegram and Twilio contacts
 cannot send outbound messages/calls or use shell, desktop controls, saved
 personal memory, or Admin tools.
 
-To receive webhooks, run a public HTTPS tunnel or reverse proxy to
-`127.0.0.1:8767` (do not expose the dashboard on port 8766). In the Twilio
-Console, configure the phone number's incoming SMS URL as
+To receive webhooks, provide a public HTTPS endpoint with TLS termination and
+proxy it to JARVIS's HTTP listener on port 8767 (do not expose the dashboard on
+port 8766). The default Loopback binding is for a reverse proxy or tunnel on
+the same computer. For router forwarding directly to this computer, select
+**All interfaces** if the router or another device terminates HTTPS and
+forwards HTTP directly to JARVIS. If the TLS-terminating reverse proxy runs on
+the JARVIS computer, keep Loopback selected and proxy to `127.0.0.1:8767`.
+The JARVIS listener itself is HTTP, not HTTPS. In the Twilio Console,
+configure the phone number's incoming SMS URL as
 `https://your-public-origin/twilio/sms` and incoming voice URL as
 `https://your-public-origin/twilio/voice`, both using HTTP POST. Enter that
 HTTPS origin in the dashboard. The voice endpoint uses Twilio speech
-recognition and returns spoken JARVIS replies; the application's webhook
-listener itself binds only to localhost.
+recognition and returns spoken JARVIS replies. Webhook requests must still
+pass Twilio signature verification and the phone-number allowlist.
 Optionally set a connection-error alert number in the dashboard. It must also
 be on the allowlist. JARVIS sends a rate-limited SMS when its own requests to
 Twilio fail to connect; this cannot detect Twilio webhook failures that never
