@@ -275,6 +275,7 @@ elif _saved_settings != {}:
 
 
 print(f"Loading speech model ({WHISPER})...")
+STT_LOCK = threading.RLock()
 stt = WhisperModel(WHISPER, device="cpu", compute_type="int8")
 
 
@@ -1052,10 +1053,11 @@ def _read_microphone_chunk(process, seconds=1):
 def _transcribe_audio(audio):
     if audio.size == 0:
         return ""
-    segments, _ = stt.transcribe(
-        audio, language="en", vad_filter=True, condition_on_previous_text=False,
-    )
-    return " ".join(segment.text for segment in segments).strip()
+    with STT_LOCK:
+        segments, _ = stt.transcribe(
+            audio, language="en", vad_filter=True, condition_on_previous_text=False,
+        )
+        return " ".join(segment.text for segment in segments).strip()
 
 
 def _has_literal_wake_phrase(transcript):
@@ -1479,6 +1481,38 @@ def handle_telegram_message(user_id, text):
         return reply
 
 
+def handle_telegram_voice(user_id, audio):
+    """Transcribe a private Telegram voice note locally, then handle it as text."""
+    fd, audio_path = tempfile.mkstemp(prefix="jarvis-telegram-", suffix=".ogg")
+    try:
+        audio_file = os.fdopen(fd, "wb")
+        fd = None
+        with audio_file:
+            audio_file.write(audio)
+        with STT_LOCK:
+            segments, _ = stt.transcribe(
+                audio_path, language="en", vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            transcript = " ".join(segment.text for segment in segments).strip()
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(audio_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"[telegram] Could not remove temporary voice file: {exc}")
+    if not transcript:
+        return "I couldn't hear any clear speech in that voice message. Please try again or send text."
+    dashboard.add_event("Telegram", "Transcribed a private voice message.")
+    return handle_telegram_message(user_id, transcript)
+
+
 def main():
     global CURRENT_USER_PROFILE, FACE_SERVICE
     history = clean_history(load_json(HISTORY_FILE, []))
@@ -1506,6 +1540,7 @@ def main():
             TELEGRAM_CONFIG_FILE, handle_telegram_message,
             on_status=lambda status: dashboard.set_state(telegram=status),
             on_event=dashboard.add_event,
+            on_voice=handle_telegram_voice,
         )
     except RuntimeError as exc:
         telegram_bot = None

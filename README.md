@@ -74,8 +74,10 @@ config (replace the token):
 ```
 
 Save it at `~/.config/jarvis/telegram.json` with owner-only permissions (`chmod
-600`), then start JARVIS and message your bot in a private chat. An empty
-`allowed_user_ids` list (or an omitted list) allows any private Telegram user
+600`), then start JARVIS and message your bot in a private chat. Text messages
+and voice notes are supported. Voice notes up to 2 minutes and 20 MB are
+transcribed locally with JARVIS's Whisper model, and JARVIS replies with text.
+An empty `allowed_user_ids` list (or an omitted list) allows any private Telegram user
 to chat. To restrict access, add numeric Telegram user IDs to the list; send
 `/id` to the bot to see your ID. Telegram access is limited to normal
 conversation, time, weather, and web search. Shell, desktop controls, saved
