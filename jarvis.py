@@ -14,6 +14,7 @@ import json
 import os
 import queue
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -569,6 +570,7 @@ def run_admin_shell(cmd):
 
 ORDER = ["deep", "normal", "fast"]
 OLLAMA_LOCK = threading.RLock()
+OLLAMA_CLIENT = ollama.Client(timeout=300.0)
 
 
 def llm_chat(model=None, **kw):
@@ -577,11 +579,13 @@ def llm_chat(model=None, **kw):
     requested_model = model or LLM
     requested_mode = next((name for name in ORDER if MODES[name] == requested_model), MODE)
     start = ORDER.index(requested_mode)
-    with OLLAMA_LOCK:
+    if not OLLAMA_LOCK.acquire(timeout=5):
+        raise TimeoutError("Ollama is busy handling another request.")
+    try:
         for mode in ORDER[start:]:
             active_model = MODES[mode]
             try:
-                return ollama.chat(model=active_model, **kw)
+                return OLLAMA_CLIENT.chat(model=active_model, **kw)
             except Exception as exc:
                 if ((not isinstance(exc, MemoryError) and "memory" not in str(exc).lower())
                         or mode == ORDER[-1]):
@@ -596,6 +600,8 @@ def llm_chat(model=None, **kw):
                     kw = {**kw, "think": False,
                           "options": {**kw.get("options", {}), "temperature": 0.2,
                                       "num_predict": 300}}
+    finally:
+        OLLAMA_LOCK.release()
     raise RuntimeError("No Ollama model could be selected.")
 
 
@@ -1053,8 +1059,21 @@ def _read_microphone_chunk(process, seconds=1):
     expected_bytes = sample_count * 2
     chunks = []
     received_bytes = 0
+    deadline = time.monotonic() + max(3.0, seconds * 3)
+    stream = process.stdout
     while received_bytes < expected_bytes:
-        chunk = process.stdout.read(expected_bytes - received_bytes)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Microphone stream stalled after {received_bytes} of {expected_bytes} bytes")
+        readable, _, _ = select.select([stream], [], [], remaining)
+        if not readable:
+            status = process.poll()
+            detail = f" after {received_bytes} of {expected_bytes} bytes"
+            if status is not None:
+                detail += f" (parecord exit code {status})"
+            raise TimeoutError(f"Timed out waiting for microphone audio{detail}")
+        chunk = os.read(stream.fileno(), expected_bytes - received_bytes)
         if not chunk:
             status = process.poll()
             detail = f" after {received_bytes} of {expected_bytes} bytes"
@@ -1070,11 +1089,15 @@ def _read_microphone_chunk(process, seconds=1):
 def _transcribe_audio(audio):
     if audio.size == 0:
         return ""
-    with STT_LOCK:
+    if not STT_LOCK.acquire(timeout=10):
+        raise TimeoutError("Speech recognition is busy with another audio request.")
+    try:
         segments, _ = stt.transcribe(
             audio, language="en", vad_filter=True, condition_on_previous_text=False,
         )
         return " ".join(segment.text for segment in segments).strip()
+    finally:
+        STT_LOCK.release()
 
 
 def _has_literal_wake_phrase(transcript):
@@ -1506,12 +1529,16 @@ def handle_telegram_voice(user_id, audio):
         fd = None
         with audio_file:
             audio_file.write(audio)
-        with STT_LOCK:
+        if not STT_LOCK.acquire(timeout=10):
+            raise TimeoutError("Speech recognition is busy with another audio request.")
+        try:
             segments, _ = stt.transcribe(
                 audio_path, language="en", vad_filter=True,
                 condition_on_previous_text=False,
             )
             transcript = " ".join(segment.text for segment in segments).strip()
+        finally:
+            STT_LOCK.release()
     finally:
         if fd is not None:
             try:
