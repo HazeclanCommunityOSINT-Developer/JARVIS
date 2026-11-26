@@ -91,3 +91,58 @@ to chat. To restrict access, add numeric Telegram user IDs to the list; send
 conversation, time, weather, and web search. Shell, desktop controls, saved
 personal memory, and Admin commands are not exposed over Telegram. Keep the bot
 token out of this repository.
+
+## Twilio SMS and VoIP voice
+
+Twilio is optional and is configured from the dashboard Settings page. Enter
+your Twilio Account SID, Auth Token, Twilio phone number, a public HTTPS origin,
+and an allowlist of phone numbers in E.164 format (for example
+`+15551234567`). Select which inbound and outbound SMS/voice permissions to
+enable, then save. Credentials are stored outside the repository in
+`~/.config/jarvis/twilio.json` with owner-only permissions; `.gitignore` also
+excludes this configuration path.
+
+Outbound messaging and calls are available only to local User/Admin profiles,
+only when explicitly requested, and only to allowlisted numbers. Inbound SMS
+and voice are separately switchable and are accepted only from allowlisted
+numbers with a valid Twilio request signature. Telegram and Twilio contacts
+cannot send outbound messages/calls or use shell, desktop controls, saved
+personal memory, or Admin tools.
+
+To receive webhooks, run a public HTTPS tunnel or reverse proxy to
+`127.0.0.1:8767` (do not expose the dashboard on port 8766). In the Twilio
+Console, configure the phone number's incoming SMS URL as
+`https://your-public-origin/twilio/sms` and incoming voice URL as
+`https://your-public-origin/twilio/voice`, both using HTTP POST. Enter that
+HTTPS origin in the dashboard. The voice endpoint uses Twilio speech
+recognition and returns spoken JARVIS replies; the application's webhook
+listener itself binds only to localhost.
+
+## Privacy policy
+
+JARVIS processes microphone input locally with Whisper and runs its assistant
+model locally through Ollama. Local voice conversations and explicitly
+remembered facts are stored in `~/.config/jarvis/history.json` and
+`~/.config/jarvis/memory.json`. Settings and integration credentials are stored
+under `~/.config/jarvis/`; Telegram and Twilio configuration files are required
+to have owner-only permissions. Face samples and profile data are kept locally
+under `~/.config/jarvis/faces`. JARVIS uses the local Motion stream for face
+recognition and does not upload those face samples.
+
+Telegram and Twilio contacts do not get access to personal memory, shell,
+desktop controls, or Admin tools. Their conversation context is held in memory
+while JARVIS runs and is not added to saved local conversation history.
+Requests made by local users to send an SMS or place a call are subject to the
+normal local conversation history settings. Twilio tool-call activity logs
+omit outbound message contents and numbers.
+
+When Twilio is enabled, phone numbers, SMS content, call audio, and/or speech
+recognition results are transmitted to Twilio to provide the enabled services.
+Twilio's handling, retention, carrier delivery, and any applicable charges are
+subject to your Twilio account settings and Twilio's privacy terms. Voice
+recognition for phone calls is provided by Twilio, not local Whisper. Messages
+sent through JARVIS are processed by the local Ollama model. Weather lookups,
+web searches, Telegram messages, and enabled Twilio features communicate with
+their respective external services and may transmit the requested data. Do not
+send sensitive information unless you accept these processing paths. Disable
+the relevant integration or permission in dashboard Settings to stop use.

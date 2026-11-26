@@ -17,6 +17,7 @@ _lock = threading.Lock()
 _server = None
 _settings_handler = None
 _face_service = None
+_twilio_service = None
 _performance_lock = threading.Lock()
 _previous_cpu_times = None
 _state = {
@@ -26,6 +27,7 @@ _state = {
     "mode": "FAST",
     "tools": [],
     "telegram": "not-configured",
+    "twilio": {},
     "settings": {},
     "facial": {"status": "unavailable", "identity": None, "profile_info": "",
                 "profiles": [], "message": "Face recognition is not configured."},
@@ -172,8 +174,8 @@ _PAGE = """<!doctype html>
     .value { margin-top:8px; font-size:20px; font-weight:650; overflow-wrap:anywhere }
     .settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px }
     .setting { display:grid; gap:5px; color:var(--muted); font-size:12px }
-    .setting input,.setting select { width:100%; border:1px solid var(--line); border-radius:8px; padding:9px; background:#0b141f; color:var(--ink); font:inherit }
-    .setting input:focus,.setting select:focus,.control-button:focus-visible,.nav-link:focus-visible { outline:2px solid var(--cyan); outline-offset:2px }
+    .setting input,.setting select,.setting textarea { width:100%; border:1px solid var(--line); border-radius:8px; padding:9px; background:#0b141f; color:var(--ink); font:inherit }
+    .setting input:focus,.setting select:focus,.setting textarea:focus,.control-button:focus-visible,.nav-link:focus-visible { outline:2px solid var(--cyan); outline-offset:2px }
     .setting.check { display:flex; align-items:center; gap:8px; padding-top:22px }
     .setting.check input { width:auto }
     .control-button { border:1px solid #3c627d; border-radius:8px; padding:9px 13px; color:var(--ink); background:#173048; cursor:pointer; font:inherit }
@@ -331,6 +333,26 @@ _PAGE = """<!doctype html>
             <div class="control-row"><button class="control-button" type="submit">Save settings</button><span id="settings-message" class="control-message"></span></div>
           </form>
         </article>
+        <article class="panel" style="margin-top:14px">
+          <h2>Twilio SMS and VoIP voice</h2>
+          <p class="stream-note">Credentials stay in ~/.config/jarvis/twilio.json. Inbound webhooks require a public HTTPS tunnel to localhost:8767.</p>
+          <form id="twilio-form">
+            <div class="settings-grid">
+              <label class="setting">Account SID<input name="account_sid" autocomplete="off" placeholder="AC…"></label>
+              <label class="setting">Auth Token<input name="auth_token" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved token"></label>
+              <label class="setting">Twilio phone number<input name="phone_number" placeholder="+15551234567"></label>
+              <label class="setting">Public HTTPS webhook origin<input name="webhook_url" placeholder="https://your-public-host.example"></label>
+              <label class="setting">Allowed phone numbers · E.164<textarea name="allowed_numbers" rows="3" placeholder="+15551234567, one number per line"></textarea></label>
+              <label class="setting check"><input name="enabled" type="checkbox"> Enable Twilio</label>
+              <label class="setting check"><input name="inbound_sms" type="checkbox"> Allow inbound SMS</label>
+              <label class="setting check"><input name="inbound_voice" type="checkbox"> Allow inbound voice</label>
+              <label class="setting check"><input name="outbound_sms" type="checkbox"> Allow outbound SMS</label>
+              <label class="setting check"><input name="outbound_voice" type="checkbox"> Allow outbound voice calls</label>
+            </div>
+            <div id="twilio-webhook-paths" class="stream-note"></div>
+            <div class="control-row"><button class="control-button" type="submit">Save Twilio settings</button><span id="twilio-message" class="control-message"></span></div>
+          </form>
+        </article>
       </section>
       <footer>Served locally at localhost:8766 · refreshes automatically</footer>
     </main>
@@ -397,6 +419,19 @@ _PAGE = """<!doctype html>
     let settingsDirty=false;
     document.getElementById("settings-form").addEventListener("input",()=>settingsDirty=true);
     document.getElementById("settings-form").addEventListener("change",()=>settingsDirty=true);
+    let twilioDirty=false;
+    function renderTwilio(t){
+      if(!t||twilioDirty)return;
+      const form=document.getElementById("twilio-form");
+      for(const key of ["account_sid","phone_number","webhook_url"]){form.elements[key].value=t[key]||"";}
+      form.elements.auth_token.value="";
+      form.elements.auth_token.placeholder=t.auth_token_configured?"Saved · leave blank to keep":"Enter Twilio Auth Token";
+      form.elements.allowed_numbers.value=(t.allowed_numbers||[]).join("\\n");
+      for(const key of ["enabled","inbound_sms","inbound_voice","outbound_sms","outbound_voice"]){form.elements[key].checked=!!t[key];}
+      put("twilio-webhook-paths",`Webhook endpoints: ${t.webhook_url||"set a public HTTPS origin"}/twilio/sms · /twilio/voice · /twilio/voice/response (local listener port ${t.webhook_port||8767})`);
+    }
+    document.getElementById("twilio-form").addEventListener("input",()=>twilioDirty=true);
+    document.getElementById("twilio-form").addEventListener("change",()=>twilioDirty=true);
     const changedProfileRoles=new Map();
     function renderFace(f){
       if(!f)return;put("face-status",f.status);put("face-identity",f.identity||"None");
@@ -448,6 +483,18 @@ _PAGE = """<!doctype html>
         presence_announce:f.elements.presence_announce.checked
       },"settings-message");if(saved)settingsDirty=false;
     });
+    document.getElementById("twilio-form").addEventListener("submit",async e=>{
+      e.preventDefault();const f=e.currentTarget;
+      const saved=await postControl("/api/twilio/settings",{
+        enabled:f.elements.enabled.checked,account_sid:f.elements.account_sid.value,
+        auth_token:f.elements.auth_token.value,phone_number:f.elements.phone_number.value,
+        webhook_url:f.elements.webhook_url.value,
+        allowed_numbers:f.elements.allowed_numbers.value.split(/[ ,\\t\\r\\n]+/).filter(Boolean),
+        inbound_sms:f.elements.inbound_sms.checked,inbound_voice:f.elements.inbound_voice.checked,
+        outbound_sms:f.elements.outbound_sms.checked,outbound_voice:f.elements.outbound_voice.checked
+      },"twilio-message");
+      if(saved){twilioDirty=false;f.elements.auth_token.value="";}
+    });
     document.getElementById("enroll-form").addEventListener("submit",async e=>{
       e.preventDefault();const f=e.currentTarget;if(f.elements.role.value==="admin"&&!confirm("Grant this profile Admin tool permissions? Elevated commands still require terminal confirmation and the OS sudo credential."))return;await postControl("/api/faces/enroll",{name:f.elements.name.value,info:f.elements.info.value,role:f.elements.role.value},"enroll-message");
     });
@@ -461,6 +508,7 @@ _PAGE = """<!doctype html>
         renderPerformance(s.performance);
         renderTools(s.tools);
         renderSettings(s.settings);renderFace(s.facial);
+        renderTwilio(s.twilio);
         renderList("messages",s.messages,"message");renderList("events",s.events,"event");
       }catch(_){put("status","Disconnected");}
     }
@@ -532,6 +580,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     "message": "Settings saved. Speech model changes require restart; startup mode remains Fast (4B).",
                     "settings": updated,
                 })
+            elif path == "/api/twilio/settings" and _twilio_service:
+                updated = _twilio_service.update_settings(payload)
+                set_state(twilio=updated)
+                self._json_response(200, {"message": "Twilio settings saved locally.", "settings": updated})
             elif path == "/api/faces/enroll" and _face_service:
                 _face_service.start_enrollment(payload.get("name"), payload.get("info", ""))
                 self._json_response(200, {"message": "Enrollment started. Look at the camera and move your head slightly."})
@@ -630,8 +682,9 @@ def _serve_dashboard(server):
             _server = None
 
 
-def configure_controls(settings_handler=None, face_service=None):
+def configure_controls(settings_handler=None, face_service=None, twilio_service=None):
     """Register local control handlers before serving the dashboard."""
-    global _settings_handler, _face_service
+    global _settings_handler, _face_service, _twilio_service
     _settings_handler = settings_handler
     _face_service = face_service
+    _twilio_service = twilio_service

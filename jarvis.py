@@ -33,6 +33,7 @@ from faster_whisper import WhisperModel
 import jarvis_dashboard as dashboard
 from jarvis_face import FaceRecognitionService
 from jarvis_telegram import TelegramBotDaemon
+from jarvis_twilio import TwilioBridge
 
 # ---------- CONFIG ----------
 # Effort modes (say "fast", "normal", or "deep" by itself). If a model won't fit in RAM,
@@ -70,6 +71,7 @@ DEFAULT_LOCATION = "Rutland, Vermont"  # used when you say "weather" with no pla
 DATA_DIR = os.path.expanduser("~/.config/jarvis")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, "telegram.json")
+TWILIO_CONFIG_FILE = os.path.join(DATA_DIR, "twilio.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory.json")    # facts you tell it
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")  # recent chat, survives restarts
 
@@ -277,6 +279,14 @@ TOOLS = [
     _tool("web_search", "Search the web for news, prices, sports, recent events, or any fact you "
                         "are unsure about. Never put personal details in the query.",
           {"query": _str("short search query")}, ["query"]),
+    _tool("send_sms", "Send an SMS only when the user explicitly asks you to message a person. "
+          "The recipient must be an allowlisted E.164 number.",
+          {"to": _str("allowlisted E.164 phone number"),
+           "message": _str("message text")}, ["to", "message"]),
+    _tool("place_call", "Place a voice call only when the user explicitly asks you to call a person. "
+          "The recipient must be an allowlisted E.164 number.",
+          {"to": _str("allowlisted E.164 phone number"),
+           "message": _str("short message to speak")}, ["to", "message"]),
 ]
 
 BASE_SYSTEM = (
@@ -1129,6 +1139,14 @@ def run_tool(name, args):
         return weather(args.get("place"))
     if name == "web_search":
         return web_search(args.get("query"), agentic=True)
+    if name == "send_sms":
+        if TWILIO_BRIDGE is None:
+            return "Twilio is not configured."
+        return TWILIO_BRIDGE.send_sms(args.get("to"), args.get("message"))
+    if name == "place_call":
+        if TWILIO_BRIDGE is None:
+            return "Twilio is not configured."
+        return TWILIO_BRIDGE.place_call(args.get("to"), args.get("message"))
     return f"I don't have a tool called {name}."
 
 
@@ -1683,6 +1701,7 @@ def think(history, user_text, profile_override=None, tool_allowlist=None,
           include_user_memory=None, announce_status=True):
     active_model = LLM
     profile = profile_override if profile_override is not None else (CURRENT_USER_PROFILE or {"role": "user"})
+    remote_contact = profile.get("name") in {"Telegram user", "Twilio contact"}
     role = profile.get("role", "user")
     if include_user_memory is None:
         include_user_memory = role != "guest"
@@ -1700,7 +1719,8 @@ def think(history, user_text, profile_override=None, tool_allowlist=None,
     usable_history = [] if role == "guest" else history[-MAX_HISTORY:]
     messages = [{"role": "system", "content": system_prompt}] + usable_history
     messages.append({"role": "user", "content": user_text})
-    dashboard.add_event("Agent", f"Started request: {user_text}")
+    dashboard.add_event("Agent", "Started remote request." if remote_contact
+                        else f"Started request: {user_text}")
     active_model = LLM
     if announce_status:
         print("[thinking...]")
@@ -1725,7 +1745,8 @@ def think(history, user_text, profile_override=None, tool_allowlist=None,
         if not tool_calls:
             answer = (message.content or "").strip()
             dashboard.set_state(status="online", activity="Waiting for voice input")
-            dashboard.add_event("Agent", "Finished response")
+            dashboard.add_event("Agent", "Finished remote response." if remote_contact
+                                else "Finished response")
             return answer
 
         if step == MAX_AGENT_STEPS:
@@ -1739,9 +1760,11 @@ def think(history, user_text, profile_override=None, tool_allowlist=None,
         for call in tool_calls:
             name = call.function.name
             args = dict(call.function.arguments or {})
-            print(f"[tool] {name} {args}")
+            display_args = ("[remote input redacted]" if remote_contact else
+                            "[redacted]" if name in {"send_sms", "place_call"} else args)
+            print(f"[tool] {name} {display_args}")
             dashboard.set_state(status="working", activity=f"Running {name}")
-            dashboard.add_event("Tool", f"{name}: {args}")
+            dashboard.add_event("Tool", f"{name}: {display_args}")
             try:
                 result = (run_tool(name, args) if name in allowed_names
                           else "That tool is not available on this connection.")
@@ -1756,6 +1779,9 @@ def think(history, user_text, profile_override=None, tool_allowlist=None,
 TELEGRAM_TOOL_ALLOWLIST = frozenset({"get_time", "weather", "web_search"})
 TELEGRAM_HISTORIES = {}
 TELEGRAM_HISTORY_LOCK = threading.Lock()
+TWILIO_HISTORIES = {}
+TWILIO_HISTORY_LOCK = threading.Lock()
+TWILIO_BRIDGE = None
 
 
 def handle_telegram_message(user_id, text):
@@ -1765,6 +1791,23 @@ def handle_telegram_message(user_id, text):
         reply = think(
             history, text,
             profile_override={"role": "user", "name": "Telegram user"},
+            tool_allowlist=TELEGRAM_TOOL_ALLOWLIST,
+            include_user_memory=False,
+        )
+        history.extend(({"role": "user", "content": text},
+                        {"role": "assistant", "content": reply}))
+        del history[:-MAX_HISTORY]
+        return reply
+
+
+def handle_twilio_message(number, text, history=None):
+    """Answer an allowlisted Twilio contact without personal memory or local controls."""
+    with TWILIO_HISTORY_LOCK:
+        if history is None:
+            history = TWILIO_HISTORIES.setdefault(number, [])
+        reply = think(
+            history, text,
+            profile_override={"role": "user", "name": "Twilio contact"},
             tool_allowlist=TELEGRAM_TOOL_ALLOWLIST,
             include_user_memory=False,
         )
@@ -1817,7 +1860,7 @@ def handle_telegram_voice(user_id, audio):
 
 
 def main():
-    global CURRENT_USER_PROFILE, FACE_SERVICE, FOLLOW_UP_READY
+    global CURRENT_USER_PROFILE, FACE_SERVICE, FOLLOW_UP_READY, TWILIO_BRIDGE
     global AUDIO_LIBRARY, DOWNLOADS_DIR, VLC_PLAYER
     FOLLOW_UP_READY = False
     DOWNLOADS_DIR = resolve_downloads_directory()
@@ -1832,13 +1875,28 @@ def main():
         departure_grace=PRESENCE_LEAVE_SECONDS,
     )
     FACE_SERVICE = face_service
-    dashboard.configure_controls(update_runtime_settings, face_service)
+    try:
+        TWILIO_BRIDGE = TwilioBridge(
+            TWILIO_CONFIG_FILE, handle_twilio_message, on_event=dashboard.add_event)
+    except RuntimeError as exc:
+        TWILIO_BRIDGE = None
+        print(f"[twilio] {exc}")
+        dashboard.add_event("Twilio error", str(exc))
+    dashboard.configure_controls(update_runtime_settings, face_service, TWILIO_BRIDGE)
     dashboard.set_state(
         status="starting", activity="Starting JARVIS", model=LLM,
         mode=MODE.upper(), tools=[item["function"]["name"] for item in TOOLS],
         settings=runtime_settings(), facial=face_service.snapshot(),
+        twilio=TWILIO_BRIDGE.settings() if TWILIO_BRIDGE else {},
     )
     face_service.start()
+    if TWILIO_BRIDGE:
+        try:
+            TWILIO_BRIDGE.start()
+            dashboard.add_event("System", "Twilio bridge configured")
+        except RuntimeError as exc:
+            print(f"[twilio] {exc}")
+            dashboard.add_event("Twilio error", str(exc))
     try:
         print(f"[dashboard] {dashboard.start_dashboard()}")
         dashboard.add_event("System", "Dashboard started")
@@ -1941,6 +1999,8 @@ def main():
     MOTION_STOP.set()
     if telegram_bot:
         telegram_bot.stop()
+    if TWILIO_BRIDGE:
+        TWILIO_BRIDGE.stop()
     face_service.stop()
     if motion_thread.is_alive():
         motion_thread.join(timeout=10)
