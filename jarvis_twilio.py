@@ -68,8 +68,8 @@ class TwilioBridge:
             "phone_number": "", "webhook_url": "", "allowed_numbers": [],
             "webhook_bind": "loopback",
             "connection_alert_number": "",
-            "inbound_sms": False, "inbound_voice": True,
-            "outbound_sms": False, "outbound_voice": True,
+            "inbound_sms": True, "inbound_voice": True,
+            "outbound_sms": True, "outbound_voice": True,
         }
 
     @staticmethod
