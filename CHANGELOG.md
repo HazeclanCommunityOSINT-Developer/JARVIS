@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- Added deadlines to microphone reads and shared STT/Ollama lock waits, plus a
+  five-minute Ollama request timeout, so stalled capture or concurrent requests
+  surface as errors instead of blocking the voice loop indefinitely.
 - Hardened settings, memory, and conversation-history loading against malformed
   or inaccessible files, and made JSON writes safer and atomic.
 - Improved Ollama fallback and failure reporting for weather, web search, system
