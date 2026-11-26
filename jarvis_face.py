@@ -219,6 +219,11 @@ class FaceRecognitionService:
         with self._lock:
             self._pending = None
         self._set_state(status="stopped", identity=None, profile_info="", message="Recognition stopped.")
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                print("[face] Recognition thread did not stop within 5 seconds.")
 
     def start_enrollment(self, name, info="", role="user"):
         if not isinstance(name, str) or not isinstance(info, str):

@@ -864,8 +864,7 @@ def show_camera(cam=None):
 def motion_watcher():
     """Background thread: speaks when a new motion event starts (rate-limited per camera)."""
     last_said, pos = {}, None
-    while True:
-        time.sleep(MOTION_POLL)
+    while not MOTION_STOP.wait(MOTION_POLL):
         try:
             size = os.path.getsize(MOTION_EVENTS)
         except OSError:
@@ -977,6 +976,7 @@ def run_tool(name, args):
 
 
 LISTENING = threading.Event()  # set while your mic is recording
+MOTION_STOP = threading.Event()
 SPEAK_LOCK = threading.RLock()
 PRESENCE_QUEUE = queue.Queue(maxsize=20)
 FACE_SERVICE = None
@@ -1598,7 +1598,10 @@ def main():
     print(f"[model] Starting in {MODE.upper()} mode: {LLM}")
     speak("Online.")
     dashboard.set_state(status="online", activity="Waiting for voice input")
-    threading.Thread(target=motion_watcher, daemon=True).start()
+    MOTION_STOP.clear()
+    motion_thread = threading.Thread(target=motion_watcher, name="jarvis-motion-watcher",
+                                     daemon=True)
+    motion_thread.start()
     while True:
         try:
             text = listen()
@@ -1661,6 +1664,14 @@ def main():
                 message = f"Could not save conversation history: {type(exc).__name__}: {exc}"
                 print(f"[storage error] {message}")
                 dashboard.add_event("Storage error", message)
+    MOTION_STOP.set()
+    if telegram_bot:
+        telegram_bot.stop()
+    face_service.stop()
+    if motion_thread.is_alive():
+        motion_thread.join(timeout=2)
+        if motion_thread.is_alive():
+            print("[shutdown] Motion watcher did not stop within 2 seconds.")
     dashboard.set_state(status="stopped", activity="JARVIS stopped")
 
 
