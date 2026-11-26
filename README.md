@@ -40,7 +40,8 @@ Starting `jarvis.py` opens the local dashboard in a browser at
 `http://localhost:8766/`. Its System Overview shows loaded agent tools. It also
 shows the active model, listening/thinking state, recent conversation, tool
 activity, and the motion camera stream from
-`http://localhost:8081/0/stream`. The dashboard binds to localhost only.
+`http://localhost:8081/0/stream`. It also reports live CPU, memory, disk usage,
+system load, and uptime. The dashboard binds to localhost only.
 
 The dashboard Settings panel controls the active effort mode, wake phrase,
 voice activation, motion announcements, TTS voice and speed, default location,

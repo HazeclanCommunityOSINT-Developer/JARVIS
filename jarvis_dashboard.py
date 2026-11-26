@@ -3,6 +3,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -16,6 +17,8 @@ _lock = threading.Lock()
 _server = None
 _settings_handler = None
 _face_service = None
+_performance_lock = threading.Lock()
+_previous_cpu_times = None
 _state = {
     "status": "starting",
     "activity": "Starting JARVIS",
@@ -63,6 +66,58 @@ def snapshot():
         return json.loads(json.dumps(_state))
 
 
+def performance_snapshot():
+    global _previous_cpu_times
+    result = {"cpu_percent": None, "memory_percent": None, "memory_used": None,
+              "memory_total": None, "disk_percent": None, "disk_used": None,
+              "disk_total": None, "load_average": None, "uptime_seconds": None}
+    try:
+        with open("/proc/stat", encoding="ascii") as stat_file:
+            cpu_line = stat_file.readline().split()
+        if cpu_line[0] == "cpu" and len(cpu_line) >= 8:
+            cpu_times = [int(value) for value in cpu_line[1:9]]
+            with _performance_lock:
+                previous = _previous_cpu_times
+                _previous_cpu_times = cpu_times
+            if previous is not None:
+                total_delta = sum(cpu_times) - sum(previous)
+                idle_delta = sum(cpu_times[3:5]) - sum(previous[3:5])
+                if total_delta > 0:
+                    result["cpu_percent"] = round(
+                        100 * (total_delta - idle_delta) / total_delta, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        memory = {}
+        with open("/proc/meminfo", encoding="ascii") as mem_file:
+            for line in mem_file:
+                key, value = line.split(":", 1)
+                if key in {"MemTotal", "MemAvailable"}:
+                    memory[key] = int(value.split()[0]) * 1024
+        total = memory["MemTotal"]
+        available = memory["MemAvailable"]
+        result.update(memory_total=total, memory_used=total - available,
+                      memory_percent=round(100 * (total - available) / total, 1))
+    except (OSError, ValueError, KeyError, ZeroDivisionError):
+        pass
+    try:
+        disk = shutil.disk_usage("/")
+        result.update(disk_total=disk.total, disk_used=disk.used,
+                      disk_percent=round(100 * disk.used / disk.total, 1))
+    except (OSError, ZeroDivisionError):
+        pass
+    try:
+        result["load_average"] = [round(value, 2) for value in os.getloadavg()]
+    except (OSError, AttributeError):
+        pass
+    try:
+        with open("/proc/uptime", encoding="ascii") as uptime_file:
+            result["uptime_seconds"] = int(float(uptime_file.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -101,6 +156,10 @@ _PAGE = """<!doctype html>
     @keyframes page-in { from { opacity:.55; transform:translateY(3px) } to { opacity:1; transform:translateY(0) } }
     .page-intro { margin:-7px 0 16px; color:var(--muted); font-size:13px }
     .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-top:14px }
+    .performance-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px }
+    .performance-card { padding:14px; border:1px solid var(--line); border-radius:10px; background:#0e1722 }
+    .performance-detail { color:var(--muted); font-size:12px; margin-top:4px; overflow-wrap:anywhere }
+    .performance-panel { margin-top:14px }
     .card,.panel { background:linear-gradient(145deg,#162333,var(--panel)); border:1px solid var(--line); border-radius:15px; box-shadow:0 12px 30px #0003 }
     .panel { padding:20px; min-height:0 }
     .overview-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px }
@@ -151,10 +210,14 @@ _PAGE = """<!doctype html>
       .topbar { align-items:flex-start; margin-bottom:18px }
       .runtime { padding-top:4px }
       .grid,.face-summary,.settings-grid { grid-template-columns:1fr }
+      .performance-grid { grid-template-columns:repeat(2,minmax(0,1fr)) }
       .profile { align-items:flex-start; flex-direction:column }
       .profile .control-row { margin-top:4px }
       .list { max-height:none }
       .overview-head { align-items:flex-start; flex-direction:column }
+    }
+    @media(max-width:420px) {
+      .performance-grid { grid-template-columns:1fr }
     }
   </style>
 </head>
@@ -188,6 +251,15 @@ _PAGE = """<!doctype html>
           <article class="card"><div class="label">Effort mode</div><div id="mode" class="value">FAST</div></article>
           <article class="card"><div class="label">Current activity</div><div id="activity" class="value">Starting JARVIS</div></article>
         </section>
+        <article class="panel performance-panel">
+          <div class="overview-head"><h2>Computer performance</h2><span class="tool-count">Live · refreshes every 1.2 seconds</span></div>
+          <div class="performance-grid">
+            <div class="performance-card"><div class="label">CPU usage</div><div id="perf-cpu" class="value">Sampling…</div><div class="performance-detail">Overall processor utilization</div></div>
+            <div class="performance-card"><div class="label">Memory usage</div><div id="perf-memory" class="value">Loading…</div><div id="perf-memory-detail" class="performance-detail"></div></div>
+            <div class="performance-card"><div class="label">Disk usage · /</div><div id="perf-disk" class="value">Loading…</div><div id="perf-disk-detail" class="performance-detail"></div></div>
+            <div class="performance-card"><div class="label">System load · 1/5/15 min</div><div id="perf-load" class="value">Loading…</div><div id="perf-uptime" class="performance-detail"></div></div>
+          </div>
+        </article>
       </section>
 
       <section class="page" id="page-conversation" data-title="Conversation" data-subtitle="Review recent messages exchanged with JARVIS." hidden>
@@ -296,6 +368,27 @@ _PAGE = """<!doctype html>
       if(!tools.length){const e=document.createElement("span");e.className="muted";e.textContent="No agent tools reported.";root.append(e);return;}
       for(const name of tools){const badge=document.createElement("span");badge.className="tool";badge.textContent=name;root.append(badge);}
     }
+    function formatBytes(value){
+      if(value===null||value===undefined)return "Unavailable";
+      const units=["B","KB","MB","GB","TB"];let size=value,index=0;
+      while(size>=1024&&index<units.length-1){size/=1024;index++;}
+      return `${size.toFixed(index===0?0:1)} ${units[index]}`;
+    }
+    function formatUptime(seconds){
+      if(seconds===null||seconds===undefined)return "Uptime unavailable";
+      const days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);
+      return `Uptime ${days}d ${hours}h ${minutes}m`;
+    }
+    function renderPerformance(p){
+      if(!p)return;
+      put("perf-cpu",p.cpu_percent===null?"Sampling…":`${p.cpu_percent}%`);
+      put("perf-memory",p.memory_percent===null?"Unavailable":`${p.memory_percent}%`);
+      put("perf-memory-detail",`${formatBytes(p.memory_used)} of ${formatBytes(p.memory_total)}`);
+      put("perf-disk",p.disk_percent===null?"Unavailable":`${p.disk_percent}%`);
+      put("perf-disk-detail",`${formatBytes(p.disk_used)} of ${formatBytes(p.disk_total)}`);
+      put("perf-load",p.load_average?p.load_average.join(" · "):"Unavailable");
+      put("perf-uptime",formatUptime(p.uptime_seconds));
+    }
     function renderSettings(s){
       if(!s||settingsDirty)return;const form=document.getElementById("settings-form");
       for(const key of ["mode","wake_word","tts_voice","tts_speed","motion_cooldown","default_location","whisper_model","keep_alive","max_agent_steps","max_history","max_facts","motion_poll","command_silence_seconds","command_max_seconds","presence_leave_seconds"]){if(s[key]!==undefined)form.elements[key].value=s[key];}
@@ -316,15 +409,18 @@ _PAGE = """<!doctype html>
         const info=document.createElement("div");info.className="profile-info";info.textContent=`${profile.role||"user"} · ${profile.info||"No extra profile details."}`;
         details.append(name,info);const actions=document.createElement("div");actions.className="control-row";
         const role=document.createElement("select");role.className="control-button";
-        const selectedRole=changedProfileRoles.get(profile.id)||(profile.role||"user");
+        const savedRole=profile.role||"user";
+        const pendingRole=changedProfileRoles.get(profile.id);
+        if(pendingRole===savedRole)changedProfileRoles.delete(profile.id);
+        const selectedRole=changedProfileRoles.get(profile.id)||savedRole;
         for(const [value,label] of [["guest","Guest"],["user","User"],["admin","Admin"]]){const option=document.createElement("option");option.value=value;option.textContent=label;option.selected=selectedRole===value;role.append(option);}
         role.onchange=async()=>{
           const nextRole=role.value;changedProfileRoles.set(profile.id,nextRole);
           if(nextRole==="admin"&&!confirm(`Grant ${profile.name} Admin tool permissions? Elevated commands still require terminal confirmation and the OS sudo credential.`)){
             changedProfileRoles.delete(profile.id);role.value=profile.role||"user";return;
           }
-          if(await postControl("/api/faces/permissions",{profile_id:profile.id,role:nextRole},"enroll-message"))changedProfileRoles.delete(profile.id);
-          else role.value=profile.role||"user";
+          const saved=await postControl("/api/faces/permissions",{profile_id:profile.id,role:nextRole},"enroll-message");
+          if(!saved){changedProfileRoles.delete(profile.id);role.value=profile.role||"user";}
         };
         const remove=document.createElement("button");remove.className="control-button danger";remove.textContent="Remove";
         remove.onclick=async()=>{if(!confirm(`Remove the local face profile for ${profile.name}?`))return;await postControl("/api/faces/delete",{profile_id:profile.id},"enroll-message");};
@@ -362,6 +458,7 @@ _PAGE = """<!doctype html>
       try{const response=await fetch("/api/state",{cache:"no-store"});if(!response.ok)throw new Error("offline");const s=await response.json();
         put("status",s.status);put("model",s.model);put("mode",s.mode);put("activity",s.activity);
         put("telegram-status",` · Telegram: ${s.telegram||"not-configured"}`);
+        renderPerformance(s.performance);
         renderTools(s.tools);
         renderSettings(s.settings);renderFace(s.facial);
         renderList("messages",s.messages,"message");renderList("events",s.events,"event");
@@ -398,7 +495,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             body = _PAGE
             content_type = "text/html; charset=utf-8"
         elif path == "/api/state":
-            body = json.dumps(snapshot(), ensure_ascii=False).encode("utf-8")
+            state = snapshot()
+            state["performance"] = performance_snapshot()
+            body = json.dumps(state, ensure_ascii=False).encode("utf-8")
             content_type = "application/json; charset=utf-8"
         elif path == "/api/settings":
             body = json.dumps(snapshot().get("settings", {}), ensure_ascii=False).encode("utf-8")
