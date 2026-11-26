@@ -568,6 +568,7 @@ def run_admin_shell(cmd):
 
 
 ORDER = ["deep", "normal", "fast"]
+OLLAMA_LOCK = threading.RLock()
 
 
 def llm_chat(model=None, **kw):
@@ -576,23 +577,25 @@ def llm_chat(model=None, **kw):
     requested_model = model or LLM
     requested_mode = next((name for name in ORDER if MODES[name] == requested_model), MODE)
     start = ORDER.index(requested_mode)
-    for mode in ORDER[start:]:
-        active_model = MODES[mode]
-        try:
-            return ollama.chat(model=active_model, **kw)
-        except Exception as exc:
-            if (not isinstance(exc, MemoryError) and "memory" not in str(exc).lower()) or mode == ORDER[-1]:
-                raise
-            next_mode = ORDER[ORDER.index(mode) + 1]
-            MODE, LLM = next_mode, MODES[next_mode]
-            print(f"[llm] not enough RAM, stepping down to {MODE} ({LLM})")
-            dashboard.set_state(mode=MODE.upper(), model=LLM)
-            dashboard.set_state(settings=runtime_settings())
-            dashboard.add_event("Model", f"Memory fallback selected {LLM}")
-            if kw.get("think"):
-                kw = {**kw, "think": False,
-                      "options": {**kw.get("options", {}), "temperature": 0.2,
-                                  "num_predict": 300}}
+    with OLLAMA_LOCK:
+        for mode in ORDER[start:]:
+            active_model = MODES[mode]
+            try:
+                return ollama.chat(model=active_model, **kw)
+            except Exception as exc:
+                if ((not isinstance(exc, MemoryError) and "memory" not in str(exc).lower())
+                        or mode == ORDER[-1]):
+                    raise
+                next_mode = ORDER[ORDER.index(mode) + 1]
+                MODE, LLM = next_mode, MODES[next_mode]
+                print(f"[llm] not enough RAM, stepping down to {MODE} ({LLM})")
+                dashboard.set_state(mode=MODE.upper(), model=LLM)
+                dashboard.set_state(settings=runtime_settings())
+                dashboard.add_event("Model", f"Memory fallback selected {LLM}")
+                if kw.get("think"):
+                    kw = {**kw, "think": False,
+                          "options": {**kw.get("options", {}), "temperature": 0.2,
+                                      "num_predict": 300}}
     raise RuntimeError("No Ollama model could be selected.")
 
 
@@ -1015,11 +1018,12 @@ def _deliver_pending_presence(process=None):
 def _start_microphone_stream():
     command = ["parecord", "--record", f"--rate={SAMPLE_RATE}", "--format=s16le",
                "--channels=1", "--raw"]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE)
     time.sleep(0.25)
     if process.poll() is not None:
+        return_code = process.returncode
         _stop_microphone_stream(process)
-        raise RuntimeError("parecord stopped before recording began")
+        raise RuntimeError(f"parecord exited with code {return_code} before recording began")
     return process
 
 
@@ -1043,10 +1047,23 @@ def _stop_microphone_stream(process):
 
 
 def _read_microphone_chunk(process, seconds=1):
+    if not process or process.stdout is None:
+        raise RuntimeError("Microphone capture has no readable stream")
     sample_count = int(SAMPLE_RATE * seconds)
-    raw = process.stdout.read(sample_count * 2)
-    if len(raw) != sample_count * 2:
-        raise RuntimeError("Microphone stream ended unexpectedly")
+    expected_bytes = sample_count * 2
+    chunks = []
+    received_bytes = 0
+    while received_bytes < expected_bytes:
+        chunk = process.stdout.read(expected_bytes - received_bytes)
+        if not chunk:
+            status = process.poll()
+            detail = f" after {received_bytes} of {expected_bytes} bytes"
+            if status is not None:
+                detail += f" (parecord exit code {status})"
+            raise RuntimeError(f"Microphone stream ended unexpectedly{detail}")
+        chunks.append(chunk)
+        received_bytes += len(chunk)
+    raw = b"".join(chunks)
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
