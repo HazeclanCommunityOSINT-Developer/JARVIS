@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.1.02 — 2026-11-25
+
+### Added
+
+- Reorganized the local dashboard into menu pages for overview, conversation,
+  activity, camera, face recognition, and settings. Navigation follows the URL
+  fragment and adapts to narrow screens.
+- Telegram private chats can now use voice notes as spoken requests. JARVIS
+  transcribes notes up to 2 minutes and 20 MB locally, then replies with text.
+
+### Fixed
+
+- Hardened settings, memory, and conversation-history loading against malformed
+  or inaccessible files, and made JSON writes safer and atomic.
+- Improved Ollama fallback and failure reporting for weather, web search, system
+  commands, and speech output. Speech recording now shuts down more reliably,
+  and text-to-speech cleans up temporary audio and falls back when playback fails.
+- Made Telegram polling and message handling more resilient to invalid updates,
+  API failures, and callback errors; diagnostics redact the bot token.
+- Improved dashboard response handling and server recovery, plus face profile
+  validation, enrollment cleanup, model rebuilding, and recognition recovery.
+
 ## v1.1 — 2026-11-25
 
 ### Added

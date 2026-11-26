@@ -12,16 +12,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
+MAX_VOICE_DURATION_SECONDS = 120
+
 
 class TelegramBotDaemon:
     def __init__(self, token, allowed_user_ids, on_message, on_status=None,
-                 on_event=None):
+                 on_event=None, on_voice=None):
         token = str(token or "").strip()
         if not token or ":" not in token:
             raise ValueError("Telegram bot token is missing or malformed.")
         self._token = token
         self._allowed_users = set(allowed_user_ids)
         self._on_message = on_message
+        self._on_voice = on_voice
         self._on_status = on_status or (lambda _status: None)
         self._on_event = on_event or (lambda _kind, _detail: None)
         self._stop = threading.Event()
@@ -30,7 +34,8 @@ class TelegramBotDaemon:
         self._status = "configured"
 
     @classmethod
-    def from_config(cls, config_path, on_message, on_status=None, on_event=None):
+    def from_config(cls, config_path, on_message, on_status=None, on_event=None,
+                    on_voice=None):
         try:
             if os.name == "posix" and os.path.exists(config_path):
                 permissions = stat.S_IMODE(os.stat(config_path).st_mode)
@@ -62,7 +67,7 @@ class TelegramBotDaemon:
             parsed_users.append(parsed_id)
         try:
             return cls(config.get("bot_token"), parsed_users, on_message,
-                       on_status, on_event)
+                       on_status, on_event, on_voice)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Invalid Telegram config: {exc}") from exc
 
@@ -183,37 +188,88 @@ class TelegramBotDaemon:
 
     def _handle_update(self, update):
         message = update.get("message") or {}
+        if not isinstance(message, dict):
+            return
         sender = message.get("from") or {}
         chat = message.get("chat") or {}
         text = message.get("text")
-        if not isinstance(text, str) or chat.get("type") != "private":
+        if not isinstance(sender, dict) or not isinstance(chat, dict) or chat.get("type") != "private":
             return
         user_id = sender.get("id")
         chat_id = chat.get("id")
         if not isinstance(user_id, int) or not isinstance(chat_id, int):
             return
-        self._add_event("Received a private message.")
-        command = text.strip().lower().split("@", 1)[0]
-        if command == "/id":
-            self._send_message(chat_id, f"Your Telegram user ID is {user_id}.")
-            self._add_event("Sent the /id response.")
-            return
+        if isinstance(text, str):
+            self._add_event("Received a private message.")
+            command = text.strip().lower().split("@", 1)[0]
+            if command == "/id":
+                self._send_message(chat_id, f"Your Telegram user ID is {user_id}.")
+                self._add_event("Sent the /id response.")
+                return
         # An empty allowlist means any private Telegram user may use the bot.
         # A populated list restricts access to the listed numeric user IDs.
         if self._allowed_users and user_id not in self._allowed_users:
             return
-        normalized = text.strip()
-        if normalized.lower() in {"/start", "/help"}:
-            self._send_message(chat_id, "JARVIS Telegram is connected. Send a message to chat. Local shell, desktop controls, and administrator commands are disabled here.")
-            self._add_event("Sent the Telegram help response.")
-            return
-        try:
-            reply = self._on_message(user_id, normalized)
-        except Exception as exc:
-            self._report_error("Message handling failed", exc)
-            reply = "I couldn't process that just now."
+
+        if isinstance(text, str):
+            normalized = text.strip()
+            if normalized.lower() in {"/start", "/help"}:
+                self._send_message(chat_id, "JARVIS Telegram is connected. Send a message or voice note to chat. Local shell, desktop controls, and administrator commands are disabled here.")
+                self._add_event("Sent the Telegram help response.")
+                return
+            try:
+                reply = self._on_message(user_id, normalized)
+            except Exception as exc:
+                self._report_error("Message handling failed", exc)
+                reply = "I couldn't process that just now."
+        else:
+            voice = message.get("voice")
+            if not isinstance(voice, dict):
+                return
+            self._add_event("Received a private voice message.")
+            file_id = voice.get("file_id")
+            duration = voice.get("duration")
+            if (not isinstance(file_id, str) or not file_id
+                    or isinstance(duration, bool) or not isinstance(duration, int)
+                    or duration <= 0):
+                reply = "I couldn't read that voice message. Please try sending it again."
+            elif duration > MAX_VOICE_DURATION_SECONDS:
+                reply = "That voice message is over 2 minutes. Please send a shorter recording."
+            elif self._on_voice is None:
+                reply = "Voice messages aren't enabled right now. Please send text instead."
+            else:
+                try:
+                    audio = self._download_voice(file_id)
+                    reply = self._on_voice(user_id, audio)
+                except Exception as exc:
+                    self._report_error("Voice message handling failed", exc)
+                    reply = "I couldn't process that voice message just now. Please try again or send text."
         self._send_message(chat_id, reply or "I've got nothing.")
         self._add_event("Sent a reply.")
+
+    def _download_voice(self, file_id):
+        result = self._api("getFile", {"file_id": file_id}, timeout=20)
+        if not isinstance(result, dict):
+            raise RuntimeError("Telegram returned invalid voice file information.")
+        file_size = result.get("file_size")
+        if isinstance(file_size, int) and not isinstance(file_size, bool):
+            if file_size > MAX_VOICE_FILE_BYTES:
+                raise ValueError("That voice message exceeds the 20 MB limit.")
+        file_path = result.get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            raise RuntimeError("Telegram did not provide a voice file path.")
+        encoded_path = urllib.parse.quote(file_path, safe="/")
+        url = f"https://api.telegram.org/file/bot{self._token}/{encoded_path}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                audio = response.read(MAX_VOICE_FILE_BYTES + 1)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise RuntimeError(f"Telegram voice download failed: {self._safe_error(exc)}") from exc
+        if len(audio) > MAX_VOICE_FILE_BYTES:
+            raise ValueError("That voice message exceeds the 20 MB limit.")
+        if not audio:
+            raise RuntimeError("Telegram returned an empty voice message.")
+        return audio
 
     def _send_message(self, chat_id, text):
         chunks = _split_message(str(text), 4000)
