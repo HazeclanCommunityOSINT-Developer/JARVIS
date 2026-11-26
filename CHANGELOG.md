@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.0 — 2026-11-26
+
+### Added
+
+- Added live computer performance metrics to the dashboard: CPU and memory
+  utilization, root filesystem usage, system load averages, and uptime.
+
+### Fixed
+
+- Keep pending facial-recognition profile permission changes selected while
+  dashboard polling waits for the updated profile state.
+
 ## v1.1.02 — 2026-11-25
 
 ### Added
