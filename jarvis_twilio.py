@@ -1,5 +1,6 @@
 """Optional Twilio SMS and voice bridge using the Python standard library."""
 import base64
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -17,11 +18,14 @@ from xml.sax.saxutils import escape
 
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 MAX_BODY_BYTES = 16 * 1024
+MAX_LOCATION_ENTRIES = 200
+MAP_URL_RE = re.compile(r"https://[^\s<>]+", re.IGNORECASE)
 WEBHOOK_BIND_HOSTS = {
-    "loopback": "172.168.0.155",
-    "all_interfaces": "172.168.0.155",
+    "loopback": "127.0.0.1",
+    "all_interfaces": "0.0.0.0",
 }
 WEBHOOK_PORT = 8767
+TWILIO_SAY_VOICE = "Polly.Brian"
 
 
 def _phone(value):
@@ -35,6 +39,9 @@ class TwilioBridge:
         self.on_event = on_event or (lambda _kind, _detail: None)
         self._lock = threading.RLock()
         self._config = self._load_config()
+        self._locations_path = os.path.join(
+            os.path.dirname(config_path) or ".", "twilio_locations.json")
+        self._locations_lock = threading.Lock()
         self._server = None
         self._thread = None
         self._voice_histories = {}
@@ -64,8 +71,10 @@ class TwilioBridge:
     @staticmethod
     def _defaults():
         return {
-            "enabled": True, "account_sid": "", "auth_token": "",
+            "enabled": False, "account_sid": "", "auth_token": "",
             "phone_number": "", "webhook_url": "", "allowed_numbers": [],
+            "blocked_numbers": [], "secretary_mode": False,
+            "location_owner_number": "",
             "webhook_bind": "loopback",
             "connection_alert_number": "",
             "inbound_sms": True, "inbound_voice": True,
@@ -75,14 +84,14 @@ class TwilioBridge:
     @staticmethod
     def _validate(config):
         validated = TwilioBridge._defaults()
-        for key in ("enabled", "inbound_sms", "inbound_voice",
+        for key in ("enabled", "inbound_sms", "inbound_voice", "secretary_mode",
                     "outbound_sms", "outbound_voice"):
             value = config.get(key, False)
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be true or false.")
             validated[key] = value
         for key in ("account_sid", "auth_token", "phone_number", "webhook_url",
-                    "connection_alert_number"):
+                    "connection_alert_number", "location_owner_number"):
             value = config.get(key, "")
             if not isinstance(value, str):
                 raise ValueError(f"{key} must be text.")
@@ -110,9 +119,20 @@ class TwilioBridge:
         if not isinstance(numbers, list) or any(not _phone(number) for number in numbers):
             raise ValueError("Allowed numbers must be a list of E.164 phone numbers.")
         validated["allowed_numbers"] = sorted(set(numbers))
+        blocked_numbers = config.get("blocked_numbers", [])
+        if not isinstance(blocked_numbers, list) or any(
+                not _phone(number) for number in blocked_numbers):
+            raise ValueError("Blocked numbers must be a list of E.164 phone numbers.")
+        validated["blocked_numbers"] = sorted(set(blocked_numbers))
+        if (validated["location_owner_number"]
+                and (not _phone(validated["location_owner_number"])
+                     or validated["location_owner_number"] not in validated["allowed_numbers"]
+                     or validated["location_owner_number"] in validated["blocked_numbers"])):
+            raise ValueError("Location updates must come from an allowlisted E.164 phone number.")
         if (validated["connection_alert_number"]
                 and (not _phone(validated["connection_alert_number"])
-                     or validated["connection_alert_number"] not in validated["allowed_numbers"])):
+                     or validated["connection_alert_number"] not in validated["allowed_numbers"]
+                     or validated["connection_alert_number"] in validated["blocked_numbers"])):
             raise ValueError("Connection alert number must be an allowlisted E.164 phone number.")
         if validated["enabled"]:
             if not validated["account_sid"] or not validated["auth_token"]:
@@ -137,7 +157,8 @@ class TwilioBridge:
         if not isinstance(values, dict):
             raise ValueError("Twilio settings must be an object.")
         allowed = {"enabled", "account_sid", "auth_token", "phone_number",
-                   "webhook_url", "allowed_numbers", "inbound_sms",
+                   "webhook_url", "allowed_numbers", "blocked_numbers",
+                   "secretary_mode", "location_owner_number", "inbound_sms",
                    "inbound_voice", "outbound_sms", "outbound_voice",
                    "connection_alert_number", "webhook_bind"}
         if set(values) != allowed:
@@ -274,7 +295,24 @@ class TwilioBridge:
             self._respond(handler, 403, "text/plain; charset=utf-8", "Forbidden.")
             return
         sender = fields.get("From", [""])[0]
-        if not config["enabled"] or sender not in config["allowed_numbers"]:
+        if not config["enabled"] or not _phone(sender):
+            self._respond(handler, 403, "text/plain; charset=utf-8", "Forbidden.")
+            return
+        is_voice = endpoint in {"/twilio/voice", "/twilio/voice/response"}
+        if sender in config["blocked_numbers"]:
+            if is_voice:
+                self._event("Rejected a blocked inbound voice call.")
+                self._respond(
+                    handler, 200, "text/xml; charset=utf-8",
+                    f"<Response>{_say('This number is unavailable. Goodbye.')}"
+                    "<Hangup/></Response>")
+            else:
+                self._event("Ignored a blocked inbound SMS.")
+                self._respond(handler, 200, "text/xml; charset=utf-8", "<Response/>")
+            return
+        if (endpoint == "/twilio/sms" and sender not in config["allowed_numbers"]
+                or is_voice and sender not in config["allowed_numbers"]
+                and not config["secretary_mode"]):
             self._respond(handler, 403, "text/plain; charset=utf-8", "Forbidden.")
             return
         try:
@@ -291,7 +329,7 @@ class TwilioBridge:
                         self._event("Ignored a duplicate inbound SMS webhook.")
                 self._respond(handler, 200, "text/xml; charset=utf-8", "<Response/>")
             elif endpoint == "/twilio/voice" and config["inbound_voice"]:
-                self._event("Received an allowlisted inbound voice call.")
+                self._event("Received an inbound voice call.")
                 twiml = self._voice_prompt()
                 self._respond(handler, 200, "text/xml; charset=utf-8", twiml)
             elif endpoint == "/twilio/voice/response" and config["inbound_voice"]:
@@ -309,14 +347,15 @@ class TwilioBridge:
                 self._respond(handler, 200, "text/xml; charset=utf-8",
                               self._voice_prompt(reply))
                 if fields.get("Confidence", [""])[0]:
-                    self._event("Processed an allowlisted inbound voice turn.")
+                    self._event("Processed an inbound voice turn.")
             else:
                 self._respond(handler, 403, "text/plain; charset=utf-8", "Disabled.")
         except Exception as exc:
             print(f"[twilio] Webhook handling failed: {type(exc).__name__}: {exc}")
             self._event("Webhook processing failed.")
+            unavailable = _say("I'm unable to help right now.")
             self._respond(handler, 200, "text/xml; charset=utf-8",
-                          "<Response><Say>I'm unable to help right now.</Say><Hangup/></Response>")
+                          f"<Response>{unavailable}<Hangup/></Response>")
 
     def _claim_message(self, message_id):
         with self._message_lock:
@@ -332,11 +371,97 @@ class TwilioBridge:
     def _process_sms(self, sender, text):
         self._event("Received an allowlisted inbound SMS.")
         try:
+            config = self.settings()
+            if sender == config["location_owner_number"]:
+                location = self._parse_location_update(text)
+                if location:
+                    self._save_location(sender, location)
+                    self._send_sms(
+                        sender,
+                        "Location update saved privately on JARVIS. It is self-reported; "
+                        "JARVIS does not verify that you visited the place.",
+                        permission="inbound_sms")
+                    self._event("Saved a private, user-submitted location update.")
+                    return
             reply = self.on_message(sender, text)
             self._send_sms(sender, reply, permission="inbound_sms")
         except Exception as exc:
             print(f"[twilio] Inbound SMS processing failed: {type(exc).__name__}: {exc}")
             self._event("Inbound SMS processing failed.")
+
+    @staticmethod
+    def _parse_location_update(text):
+        for match in MAP_URL_RE.finditer(text):
+            candidate = match.group(0).rstrip(".,!?;:)")
+            parsed = urllib.parse.urlsplit(candidate)
+            host = (parsed.hostname or "").lower()
+            allowed = (
+                host == "maps.app.goo.gl"
+                or host in {"google.com", "www.google.com", "maps.google.com"}
+                and parsed.path.startswith("/maps")
+                or host == "goo.gl" and parsed.path.startswith("/maps/")
+            )
+            if parsed.scheme == "https" and allowed and not parsed.username and not parsed.password:
+                label = (text[:match.start()] + text[match.end():]).strip(" \t\r\n-:;,.")
+                return {"url": candidate, "label": label[:200]}
+        return None
+
+    def _save_location(self, sender, location):
+        with self._locations_lock:
+            entries = []
+            try:
+                if os.path.exists(self._locations_path):
+                    if stat.S_IMODE(os.stat(self._locations_path).st_mode) & 0o077:
+                        raise RuntimeError("Location history is readable by other users; run chmod 600 on it.")
+                    with open(self._locations_path, encoding="utf-8") as location_file:
+                        entries = json.load(location_file)
+                if not isinstance(entries, list):
+                    raise RuntimeError("Location history must contain a JSON array.")
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Could not read location history: {exc}") from exc
+            entries.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "sender": sender,
+                "label": location["label"],
+                "url": location["url"],
+            })
+            entries = entries[-MAX_LOCATION_ENTRIES:]
+            directory = os.path.dirname(self._locations_path) or "."
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(
+                prefix=".twilio-locations.", suffix=".tmp", dir=directory)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as location_file:
+                    json.dump(entries, location_file, ensure_ascii=False, indent=2)
+                    location_file.flush()
+                    os.fsync(location_file.fileno())
+                os.replace(temporary, self._locations_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+    def recent_locations(self, limit=10):
+        with self._locations_lock:
+            try:
+                if not os.path.exists(self._locations_path):
+                    return []
+                if stat.S_IMODE(os.stat(self._locations_path).st_mode) & 0o077:
+                    raise RuntimeError("Location history is readable by other users; run chmod 600 on it.")
+                with open(self._locations_path, encoding="utf-8") as location_file:
+                    entries = json.load(location_file)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Could not read location history: {exc}") from exc
+            if not isinstance(entries, list):
+                raise RuntimeError("Location history must contain a JSON array.")
+            entries = [
+                entry for entry in entries
+                if isinstance(entry, dict)
+                and isinstance(entry.get("timestamp"), str)
+                and isinstance(entry.get("label", ""), str)
+                and isinstance(entry.get("url"), str)
+            ]
+            return entries[-max(1, min(int(limit), 20)):]
 
     def _voice_prompt(self, message="Hello. This is JARVIS. What can I help you with?"):
         action = _xml_text(message)
@@ -348,8 +473,9 @@ class TwilioBridge:
                           {'"': "&quot;", "'": "&apos;"})
         return (
             '<?xml version="1.0" encoding="UTF-8"?><Response><Gather input="speech" '
-            'language="en-US" method="POST" speechTimeout="auto" timeout="8" '
-            f'action="{callback}"><Say>{action}</Say></Gather><Say>Goodbye.</Say><Hangup/></Response>'
+            'language="en-GB" method="POST" speechTimeout="auto" timeout="8" '
+            f'action="{callback}">{_say(action)}</Gather>{_say("Goodbye.")}'
+            "<Hangup/></Response>"
         )
 
     def _valid_signature(self, config, request_path, fields, signature):
@@ -419,7 +545,7 @@ class TwilioBridge:
             config = dict(self._config)
         if not config["enabled"] or not config[permission]:
             raise RuntimeError(f"Twilio {permission.replace('_', ' ')} is disabled.")
-        if recipient not in config["allowed_numbers"]:
+        if recipient not in config["allowed_numbers"] or recipient in config["blocked_numbers"]:
             raise ValueError("That number is not on the Twilio allowlist.")
         message = str(message or "").strip()
         if not message or len(message) > 1500:
@@ -435,14 +561,14 @@ class TwilioBridge:
             config = dict(self._config)
         if not config["enabled"] or not config["outbound_voice"]:
             raise RuntimeError("Outbound voice calls are disabled in Twilio settings.")
-        if recipient not in config["allowed_numbers"]:
+        if recipient not in config["allowed_numbers"] or recipient in config["blocked_numbers"]:
             raise ValueError("That number is not on the Twilio allowlist.")
         message = str(message or "").strip()
         if not message or len(message) > 1200:
             raise ValueError("Call message must contain 1 to 1200 characters.")
         self._api("Calls.json", {
             "From": config["phone_number"], "To": recipient,
-            "Twiml": f"<Response><Say>{_xml_text(message)}</Say></Response>",
+            "Twiml": f"<Response>{_say(message)}</Response>",
         })
         self._event("Started an outbound voice call to an allowlisted number.")
         return "Voice call started."
@@ -458,3 +584,8 @@ def _xml_text(value):
         or "\U00010000" <= char <= "\U0010ffff"
     )
     return escape(valid)
+
+
+def _say(value):
+    return (f'<Say voice="{TWILIO_SAY_VOICE}" language="en-GB">'
+            f'{_xml_text(value)}</Say>')

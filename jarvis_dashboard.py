@@ -1,9 +1,11 @@
 """Local read-only web dashboard for JARVIS runtime state."""
 from datetime import datetime
+import ast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -24,6 +26,7 @@ _last_connection_alert = None
 _CONNECTION_ALERT_COOLDOWN = 600
 _performance_lock = threading.Lock()
 _previous_cpu_times = None
+MAX_TERMINAL_TEXT_CHARS = 500_000
 _state = {
     "status": "starting",
     "activity": "Starting JARVIS",
@@ -105,6 +108,90 @@ def twilio_event(kind, detail):
 def snapshot():
     with _lock:
         return json.loads(json.dumps(_state))
+
+
+def _gdbus_call(service, path, method, *args):
+    result = subprocess.run(
+        ["gdbus", "call", "--session", "--dest", service,
+         "--object-path", path, "--method", method, *map(str, args)],
+        capture_output=True, text=True, timeout=3, check=True,
+    )
+    return ast.literal_eval(result.stdout.strip())
+
+
+def terminal_snapshot():
+    if not shutil.which("gdbus"):
+        return {"available": False, "message": "Terminal inspection requires the gdbus utility.",
+                "terminals": []}
+    try:
+        names = _gdbus_call(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.ListNames")[0]
+    except (OSError, subprocess.SubprocessError, ValueError, SyntaxError):
+        return {"available": False, "message": "Could not connect to the desktop session bus.",
+                "terminals": []}
+
+    terminals = []
+    errors = 0
+    for service in sorted(name for name in names
+                          if name.startswith("org.kde.konsole-")
+                          and name.rsplit("-", 1)[-1].isdecimal()):
+        try:
+            introspection = subprocess.run(
+                ["gdbus", "introspect", "--session", "--dest", service,
+                 "--object-path", "/Windows"],
+                capture_output=True, text=True, timeout=3, check=True,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            errors += 1
+            continue
+        window_ids = re.findall(r"^\s+node ([0-9]+) \{$", introspection, re.MULTILINE)
+        for window_id in window_ids:
+            window_path = f"/Windows/{window_id}"
+            try:
+                session_ids = _gdbus_call(
+                    service, window_path, "org.kde.konsole.Window.sessionList")[0]
+            except (OSError, subprocess.SubprocessError, ValueError, SyntaxError):
+                errors += 1
+                continue
+            for session_id in session_ids:
+                session_path = f"/Sessions/{session_id}"
+                try:
+                    title = _gdbus_call(
+                        service, session_path, "org.kde.konsole.Session.title", 1)[0]
+                    process_id = _gdbus_call(
+                        service, session_path, "org.kde.konsole.Session.processId")[0]
+                    foreground_pid = _gdbus_call(
+                        service, session_path,
+                        "org.kde.konsole.Session.foregroundProcessId")[0]
+                    lines = _gdbus_call(
+                        service, session_path,
+                        "org.kde.konsole.Session.getAllDisplayedText")[0]
+                    text = "\n".join(lines)
+                    truncated = len(text) > MAX_TERMINAL_TEXT_CHARS
+                    if truncated:
+                        text = text[-MAX_TERMINAL_TEXT_CHARS:]
+                    terminals.append({
+                        "id": f"{service}:{session_id}",
+                        "title": title or f"Konsole session {session_id}",
+                        "process_id": process_id,
+                        "foreground_pid": foreground_pid,
+                        "text": text,
+                        "truncated": truncated,
+                    })
+                except (OSError, subprocess.SubprocessError, ValueError, SyntaxError):
+                    errors += 1
+                    terminals.append({
+                        "id": f"{service}:{session_id}",
+                        "title": f"Konsole session {session_id}",
+                        "process_id": None,
+                        "foreground_pid": None,
+                        "text": "Could not read this terminal session.",
+                        "truncated": False,
+                    })
+    message = (f"{errors} terminal session(s) could not be read."
+               if errors else "Terminal display text is read-only and stays on this computer.")
+    return {"available": True, "message": message, "terminals": terminals}
 
 
 def performance_snapshot():
@@ -227,6 +314,10 @@ _PAGE = """<!doctype html>
     .profiles { display:grid; gap:8px; margin-top:12px }
     .profile { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:9px 11px; background:#0e1722; border-radius:9px }
     .profile-info { color:var(--muted); font-size:12px; white-space:pre-wrap }
+    .terminal-list { display:grid; gap:14px; margin-top:14px }
+    .terminal-card { overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#080d14 }
+    .terminal-head { display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; padding:10px 12px; color:var(--muted); font-size:12px; border-bottom:1px solid var(--line) }
+    .terminal-output { max-height:60vh; overflow:auto; margin:0; padding:12px; color:#d5e0ed; font:12px/1.45 ui-monospace,monospace; white-space:pre; tab-size:8 }
     .stream-frame { width:100%; aspect-ratio:16/9; display:grid; place-items:center; overflow:hidden; border-radius:10px; background:#080d14; border:1px solid var(--line) }
     .stream-frame img { display:block; width:100%; height:100%; object-fit:contain }
     .stream-note { color:var(--muted); font-size:12px; margin-top:8px }
@@ -272,7 +363,8 @@ _PAGE = """<!doctype html>
         <a class="nav-link" href="#activity" data-page="activity"><span class="nav-icon" aria-hidden="true">03</span><span>Activity</span></a>
         <a class="nav-link" href="#camera" data-page="camera"><span class="nav-icon" aria-hidden="true">04</span><span>Camera</span></a>
         <a class="nav-link" href="#recognition" data-page="recognition"><span class="nav-icon" aria-hidden="true">05</span><span>Face recognition</span></a>
-        <a class="nav-link" href="#settings" data-page="settings"><span class="nav-icon" aria-hidden="true">06</span><span>Settings</span></a>
+        <a class="nav-link" href="#terminals" data-page="terminals"><span class="nav-icon" aria-hidden="true">06</span><span>Terminal windows</span></a>
+        <a class="nav-link" href="#settings" data-page="settings"><span class="nav-icon" aria-hidden="true">07</span><span>Settings</span></a>
       </nav>
       <div class="sidebar-foot"><span class="local-dot" aria-hidden="true"></span><span>Running on this computer</span></div>
     </aside>
@@ -311,6 +403,15 @@ _PAGE = """<!doctype html>
       <section class="page" id="page-activity" data-title="Activity" data-subtitle="See what JARVIS and its tools have been doing." hidden>
         <p class="page-intro">Runtime events, service updates, and tool activity appear here.</p>
         <article class="panel"><h2>Recent activity</h2><div id="events" class="list"><div class="empty">No activity yet.</div></div></article>
+      </section>
+
+      <section class="page" id="page-terminals" data-title="Terminal windows" data-subtitle="Read-only view of open Konsole sessions." hidden>
+        <article class="panel">
+          <h2>Open terminal windows</h2>
+          <p class="stream-note">Live terminal output can contain passwords, tokens, private messages, and other sensitive data. This page displays the current Konsole scrollback, is served only by the local dashboard, and does not send input to terminals.</p>
+          <div id="terminal-status" class="muted">Loading terminal sessions…</div>
+          <div id="terminal-list" class="terminal-list"></div>
+        </article>
       </section>
 
       <section class="page" id="page-camera" data-title="Camera" data-subtitle="View the local Motion camera stream." hidden>
@@ -375,6 +476,7 @@ _PAGE = """<!doctype html>
         <article class="panel" style="margin-top:14px">
           <h2>Twilio SMS and VoIP voice</h2>
           <p class="stream-note">Credentials stay in ~/.config/jarvis/twilio.json. The listener speaks HTTP; use a TLS-terminating HTTPS proxy/tunnel. Keep Loopback for a proxy on this computer; select All interfaces when another device/router forwards HTTP to this computer.</p>
+          <p class="stream-note">Secretary mode routes calls from any non-blocked number to JARVIS; SMS stays allowlist-only, and the blocklist takes precedence. Google Maps location links are saved only from the configured, allowlisted owner number.</p>
           <form id="twilio-form">
             <div class="settings-grid">
               <label class="setting">Account SID<input name="account_sid" autocomplete="off" placeholder="AC…"></label>
@@ -383,10 +485,13 @@ _PAGE = """<!doctype html>
               <label class="setting">Public HTTPS webhook origin<input name="webhook_url" placeholder="https://your-public-host.example"></label>
               <label class="setting">Webhook network binding<select name="webhook_bind"><option value="loopback">Loopback only · local reverse proxy</option><option value="all_interfaces">All interfaces · router forwarding</option></select></label>
               <label class="setting">Allowed phone numbers · E.164<textarea name="allowed_numbers" rows="3" placeholder="+15551234567, one number per line"></textarea></label>
+              <label class="setting">Blocked phone numbers · E.164<textarea name="blocked_numbers" rows="3" placeholder="+15551234567, one number per line"></textarea></label>
+              <label class="setting">Location-update owner number · must be allowlisted<input name="location_owner_number" placeholder="+15551234567"></label>
               <label class="setting">Connection-error alert number · must be allowlisted<input name="connection_alert_number" placeholder="+15551234567"></label>
               <label class="setting check"><input name="enabled" type="checkbox"> Enable Twilio</label>
               <label class="setting check"><input name="inbound_sms" type="checkbox"> Allow inbound SMS</label>
               <label class="setting check"><input name="inbound_voice" type="checkbox"> Allow inbound voice</label>
+              <label class="setting check"><input name="secretary_mode" type="checkbox"> Secretary mode · answer calls from any non-blocked number</label>
               <label class="setting check"><input name="outbound_sms" type="checkbox"> Allow outbound SMS</label>
               <label class="setting check"><input name="outbound_voice" type="checkbox"> Allow outbound voice calls</label>
             </div>
@@ -399,6 +504,7 @@ _PAGE = """<!doctype html>
     </main>
   </div>
   <script>
+    let terminalRefreshPending=false;
     function selectPage(id){
       const page=document.getElementById(`page-${id}`)||document.getElementById("page-overview");
       for(const item of document.querySelectorAll(".page"))item.hidden=item!==page;
@@ -409,6 +515,7 @@ _PAGE = """<!doctype html>
       document.getElementById("page-title").textContent=page.dataset.title;
       document.getElementById("page-subtitle").textContent=page.dataset.subtitle;
       document.title=`${page.dataset.title} · JARVIS`;
+      if(id==="terminals")refreshTerminals();
     }
     function syncPageFromHash(){selectPage(window.location.hash.slice(1)||"overview");}
     window.addEventListener("hashchange",syncPageFromHash);
@@ -452,6 +559,47 @@ _PAGE = """<!doctype html>
       put("perf-load",p.load_average?p.load_average.join(" · "):"Unavailable");
       put("perf-uptime",formatUptime(p.uptime_seconds));
     }
+    function renderTerminals(data){
+      put("terminal-status",data.message||"");
+      const root=document.getElementById("terminal-list");
+      const scrollPositions=new Map([...root.querySelectorAll(".terminal-output")].map(
+        output=>[output.dataset.terminalId,output.scrollTop]));
+      root.replaceChildren();
+      if(!data.terminals||!data.terminals.length){
+        const empty=document.createElement("div");empty.className="empty";
+        empty.textContent=data.available?"No open Konsole sessions found.":data.message;
+        root.append(empty);return;
+      }
+      for(const terminal of data.terminals){
+        const card=document.createElement("article");card.className="terminal-card";
+        const head=document.createElement("div");head.className="terminal-head";
+        const title=document.createElement("strong");title.textContent=terminal.title;
+        const pids=document.createElement("span");
+        pids.textContent=`Shell PID ${terminal.process_id??"?"} · Foreground PID ${terminal.foreground_pid??"?"}`;
+        head.append(title,pids);
+        const output=document.createElement("pre");output.className="terminal-output";
+        output.dataset.terminalId=terminal.id;
+        output.textContent=terminal.text||"(No terminal output.)";
+        output.scrollTop=scrollPositions.get(terminal.id)??output.scrollHeight;
+        card.append(head,output);
+        if(terminal.truncated){
+          const note=document.createElement("div");note.className="stream-note";
+          note.textContent="Older scrollback omitted after the 500,000-character display limit.";
+          card.append(note);
+        }
+        root.append(card);
+      }
+    }
+    async function refreshTerminals(){
+      if(terminalRefreshPending)return;
+      terminalRefreshPending=true;
+      try{
+        const response=await fetch("/api/terminals",{cache:"no-store"});
+        if(!response.ok)throw new Error(`Terminal request failed (${response.status}).`);
+        renderTerminals(await response.json());
+      }catch(error){put("terminal-status",error.message);}
+      finally{terminalRefreshPending=false;}
+    }
     function renderSettings(s){
       if(!s||settingsDirty)return;const form=document.getElementById("settings-form");
       for(const key of ["mode","wake_word","tts_voice","tts_speed","motion_cooldown","default_location","whisper_model","keep_alive","max_agent_steps","max_history","max_facts","motion_poll","command_silence_seconds","command_max_seconds","presence_leave_seconds"]){if(s[key]!==undefined)form.elements[key].value=s[key];}
@@ -469,8 +617,10 @@ _PAGE = """<!doctype html>
       form.elements.auth_token.value="";
       form.elements.auth_token.placeholder=t.auth_token_configured?"Saved · leave blank to keep":"Enter Twilio Auth Token";
       form.elements.allowed_numbers.value=(t.allowed_numbers||[]).join("\\n");
+      form.elements.blocked_numbers.value=(t.blocked_numbers||[]).join("\\n");
+      form.elements.location_owner_number.value=t.location_owner_number||"";
       form.elements.connection_alert_number.value=t.connection_alert_number||"";
-      for(const key of ["enabled","inbound_sms","inbound_voice","outbound_sms","outbound_voice"]){form.elements[key].checked=!!t[key];}
+      for(const key of ["enabled","inbound_sms","inbound_voice","secretary_mode","outbound_sms","outbound_voice"]){form.elements[key].checked=!!t[key];}
       put("twilio-webhook-paths",`Webhook endpoints: ${t.webhook_url||"set a public HTTPS origin"}/twilio/sms · /twilio/voice · /twilio/voice/response (local listener port ${t.webhook_port||8767})`);
     }
     document.getElementById("twilio-form").addEventListener("input",()=>twilioDirty=true);
@@ -533,7 +683,10 @@ _PAGE = """<!doctype html>
         auth_token:f.elements.auth_token.value,phone_number:f.elements.phone_number.value,
         webhook_url:f.elements.webhook_url.value,webhook_bind:f.elements.webhook_bind.value,
         allowed_numbers:f.elements.allowed_numbers.value.split(/[ ,\\t\\r\\n]+/).filter(Boolean),
+        blocked_numbers:f.elements.blocked_numbers.value.split(/[ ,\\t\\r\\n]+/).filter(Boolean),
+        location_owner_number:f.elements.location_owner_number.value,
         connection_alert_number:f.elements.connection_alert_number.value,
+        secretary_mode:f.elements.secretary_mode.checked,
         inbound_sms:f.elements.inbound_sms.checked,inbound_voice:f.elements.inbound_voice.checked,
         outbound_sms:f.elements.outbound_sms.checked,outbound_voice:f.elements.outbound_voice.checked
       },"twilio-message");
@@ -557,6 +710,7 @@ _PAGE = """<!doctype html>
       }catch(_){put("status","Disconnected");}
     }
     refresh();setInterval(refresh,1200);
+    setInterval(()=>{if(!document.getElementById("page-terminals").hidden)refreshTerminals();},5000);
   </script>
 </body>
 </html>""".encode("utf-8")
@@ -590,6 +744,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             state = snapshot()
             state["performance"] = performance_snapshot()
             body = json.dumps(state, ensure_ascii=False).encode("utf-8")
+            content_type = "application/json; charset=utf-8"
+        elif path == "/api/terminals":
+            body = json.dumps(terminal_snapshot(), ensure_ascii=False).encode("utf-8")
             content_type = "application/json; charset=utf-8"
         elif path == "/api/settings":
             body = json.dumps(snapshot().get("settings", {}), ensure_ascii=False).encode("utf-8")

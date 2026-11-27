@@ -41,7 +41,9 @@ Starting `jarvis.py` opens the local dashboard in a browser at
 shows the active model, listening/thinking state, recent conversation, tool
 activity, and the motion camera stream from
 `http://localhost:8081/0/stream`. It also reports live CPU, memory, disk usage,
-system load, and uptime. The dashboard binds to localhost only.
+system load, and uptime. Its Terminal Windows page displays read-only Konsole
+session scrollback locally; terminal output can contain secrets. The dashboard
+binds to localhost only.
 
 The dashboard Settings panel controls the active effort mode, wake phrase,
 voice activation, motion announcements, TTS voice and speed, default location,
@@ -104,10 +106,22 @@ excludes this configuration path.
 
 Outbound messaging and calls are available only to local User/Admin profiles,
 only when explicitly requested, and only to allowlisted numbers. Inbound SMS
-and voice are separately switchable and are accepted only from allowlisted
-numbers with a valid Twilio request signature. Telegram and Twilio contacts
-cannot send outbound messages/calls or use shell, desktop controls, saved
-personal memory, or Admin tools.
+and voice are separately switchable and require a valid Twilio request
+signature. SMS is accepted only from allowlisted numbers. Voice calls are
+normally allowlist-only; optional **Secretary mode** routes any caller not on
+the blocklist to JARVIS, without giving them access to local controls, saved
+personal memory, or Admin tools. Blocklisted numbers are rejected before
+secretary routing. Caller ID can be spoofed, so it is not proof of identity.
+Carrier forwarding from a personal number (including forwarding while Do Not
+Disturb is active) depends on the carrier and may not preserve the caller ID.
+
+Optionally set a location-update owner number in Twilio settings; it must also
+be allowlisted. Google Maps links sent by that number are saved with their
+received time in `~/.config/jarvis/twilio_locations.json`, with owner-only
+permissions and a 200-entry cap. JARVIS can discuss those self-reported
+locations only with allowlisted callers, and only when they ask. A link is not
+proof that the user visited the place. SMS from other numbers cannot add
+location entries.
 
 To receive webhooks, provide a public HTTPS endpoint with TLS termination and
 proxy it to JARVIS's HTTP listener on port 8767 (do not expose the dashboard on
@@ -120,9 +134,12 @@ The JARVIS listener itself is HTTP, not HTTPS. In the Twilio Console,
 configure the phone number's incoming SMS URL as
 `https://your-public-origin/twilio/sms` and incoming voice URL as
 `https://your-public-origin/twilio/voice`, both using HTTP POST. Enter that
-HTTPS origin in the dashboard. The voice endpoint uses Twilio speech
-recognition and returns spoken JARVIS replies. Webhook requests must still
-pass Twilio signature verification and the phone-number allowlist.
+HTTPS origin in the dashboard. The voice endpoint uses Twilio speech recognition and returns spoken JARVIS replies.
+Webhook requests must still pass Twilio signature verification and the
+configured caller policy.
+Twilio speech uses its built-in Polly Brian en-GB voice, chosen as a close
+British male match for JARVIS's local voice. Twilio cannot use the local
+Kokoro voice directly, so the timbre will not be identical.
 Optionally set a connection-error alert number in the dashboard. It must also
 be on the allowlist. JARVIS sends a rate-limited SMS when its own requests to
 Twilio fail to connect; this cannot detect Twilio webhook failures that never
@@ -138,10 +155,15 @@ under `~/.config/jarvis/`; Telegram and Twilio configuration files are required
 to have owner-only permissions. Face samples and profile data are kept locally
 under `~/.config/jarvis/faces`. JARVIS uses the local Motion stream for face
 recognition and does not upload those face samples.
+The local dashboard can display open Konsole scrollback, which may contain
+credentials or private data; it is not sent to external services by that
+feature.
 
 Telegram and Twilio contacts do not get access to personal memory, shell,
 desktop controls, or Admin tools. Their conversation context is held in memory
 while JARVIS runs and is not added to saved local conversation history.
+Allowlisted Twilio callers may receive the private, user-submitted location
+history described above when they specifically request it.
 Requests made by local users to send an SMS or place a call are subject to the
 normal local conversation history settings. Twilio tool-call activity logs
 omit outbound message contents and numbers.

@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.2.1 — 2026-11-26
+
+### Added
+
+- Added a local dashboard page showing read-only Konsole session contents, with
+  a per-session display limit and a warning that terminal output may contain
+  sensitive information.
+- Added optional Twilio secretary mode to route non-blocked inbound callers to
+  JARVIS, plus a configurable phone-number blocklist.
+- Added private location check-ins by Google Maps SMS link from a configured,
+  allowlisted owner number. Location history is stored locally with restrictive
+  permissions and may be discussed only with allowlisted callers who ask.
+- The startup greeting now begins with the local time and current weather.
+- Twilio voice prompts use a British English male voice to better match JARVIS's
+  local speech.
+
+### Changed
+
+- Twilio settings now expose the blocklist, secretary mode, and location-update
+  owner in the dashboard.
+- Updated Twilio and terminal-dashboard setup and privacy documentation.
+
 ## v1.2.0 — 2026-11-26
 
 ### Added
