@@ -18,8 +18,8 @@ from xml.sax.saxutils import escape
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 MAX_BODY_BYTES = 16 * 1024
 WEBHOOK_BIND_HOSTS = {
-    "loopback": "71.232.156.65",
-    "all_interfaces": "71.232.156.65",
+    "loopback": "172.168.0.155",
+    "all_interfaces": "172.168.0.155",
 }
 WEBHOOK_PORT = 8767
 
