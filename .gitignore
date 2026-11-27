@@ -10,5 +10,12 @@ __pycache__/
 *.backup
 *.bak*
 
+# Keep Jarvis configuration files trackable
+!/.config/
+!/.config/jarvis/
+!/.config/jarvis/**
+/.config/jarvis/telegram.json
+/.config/jarvis/twilio.json
+
 # Generated audio
 /kokoro_test.wav
